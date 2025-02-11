@@ -10,6 +10,8 @@ import (
 	"github.com/metacubex/mihomo/component/iface/anet"
 
 	"github.com/metacubex/bart"
+
+    "github.com/metacubex/mihomo/constant/features"
 )
 
 type Interface struct {
@@ -33,14 +35,22 @@ type ifaceCache struct {
 }
 
 var caches = singledo.NewSingle[*ifaceCache](time.Second * 20)
+var netInterfaces = []net.Interface{}
+// arkui 注入进来
+func setNetInterfaces(nets []net.Interface){
+    netInterfaces = nets
+}
 
 func getCache() (*ifaceCache, error) {
 	value, err, _ := caches.Do(func() (*ifaceCache, error) {
 		ifaces, err := anet.Interfaces()
-		if err != nil {
-			return nil, err
+		if !features.OHOS {
+			if err != nil {
+				return nil, err
+			}
+		} else {
+			ifaces = netInterfaces
 		}
-
 		cache := &ifaceCache{
 			ifMapByName: make(map[string]*Interface),
 			ifMapByAddr: make(map[netip.Addr]*Interface),
