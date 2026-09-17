@@ -36,9 +36,10 @@ type ifaceCache struct {
 
 var caches = singledo.NewSingle[*ifaceCache](time.Second * 20)
 var netInterfaces = []net.Interface{}
-// arkui 注入进来
-func setNetInterfaces(nets []net.Interface){
-    netInterfaces = nets
+
+// SetNetInterfaces injects interfaces from arkui.
+func SetNetInterfaces(nets []net.Interface) {
+	netInterfaces = nets
 }
 
 func getCache() (*ifaceCache, error) {

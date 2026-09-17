@@ -2,6 +2,7 @@ package provider
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
 	"io"
@@ -10,6 +11,7 @@ import (
 	"time"
 
 	"github.com/metacubex/mihomo/common/pool"
+	"github.com/metacubex/mihomo/common/utils"
 	"github.com/metacubex/mihomo/common/yaml"
 	"github.com/metacubex/mihomo/component/resource"
 	C "github.com/metacubex/mihomo/constant"
@@ -21,6 +23,26 @@ var tunnel P.Tunnel
 
 func SetTunnel(t P.Tunnel) {
 	tunnel = t
+}
+
+// localOnlyVehicle 屏蔽远程规则集网络下载:
+// 远程规则集由 ArkTS 前端预下载到 vehicle.Path() 后交由内核加载,
+// 内核侧禁用一切网络拉取(Initial 兜底 / interval 轮询 / RESTful API 触发全部经由 Read)。
+type localOnlyVehicle struct {
+	inner P.Vehicle
+}
+
+var errRuleFetchDisabled = errors.New("rule set remote fetch disabled (frontend-managed)")
+
+func (l *localOnlyVehicle) Type() P.VehicleType { return l.inner.Type() }
+func (l *localOnlyVehicle) Path() string        { return l.inner.Path() }
+func (l *localOnlyVehicle) Url() string         { return l.inner.Url() }
+func (l *localOnlyVehicle) Proxy() string       { return l.inner.Proxy() }
+func (l *localOnlyVehicle) Write(buf []byte) error {
+	return l.inner.Write(buf)
+}
+func (l *localOnlyVehicle) Read(_ context.Context, oldHash utils.HashType) ([]byte, utils.HashType, error) {
+	return nil, oldHash, errRuleFetchDisabled
 }
 
 type RulePayload struct {
@@ -123,6 +145,12 @@ func (rp *RuleSetProvider) Close() error {
 }
 
 func NewRuleSetProvider(name string, behavior P.RuleBehavior, format P.RuleFormat, interval time.Duration, vehicle P.Vehicle, payload []string, bundleFile resource.BundleFile, parse common.ParseRuleFunc) P.RuleProvider {
+	// ★ 远程规则集改由前端管理: HTTP vehicle 包装为仅本地(网络读取一律拒绝) + interval 归零(禁轮询,
+	// 避免每轮 Read 失败触发 backoff 重试刷日志)。本地缓存缺失时 Initial 报错仅 Warnln(executor 容错), 规则集置空。
+	if vehicle.Type() == P.HTTP {
+		vehicle = &localOnlyVehicle{inner: vehicle}
+		interval = 0
+	}
 	rp := &ruleSetProvider{
 		baseProvider: baseProvider{
 			behavior: behavior,
@@ -142,7 +170,6 @@ func NewRuleSetProvider(name string, behavior P.RuleBehavior, format P.RuleForma
 	rp.Fetcher = resource.NewFetcher(name, interval, vehicle, bundleFile, func(bytes []byte) (ruleStrategy, error) {
 		return rulesParse(bytes, newStrategy(behavior, parse), format)
 	}, onUpdate)
-
 	wrapper := &RuleSetProvider{
 		rp,
 	}
