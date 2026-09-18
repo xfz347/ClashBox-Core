@@ -157,6 +157,14 @@ func LookupIPWithResolver(ctx context.Context, host string, r Resolver) ([]netip
 		return node.IPs, nil
 	}
 
+	// IP 字面量直通, 不受 DisableIPv6 影响:
+	// DisableIPv6 语义是"域名解析不查 AAAA", 但客户端携带 IPv6 字面量目标的直连流量
+	// (TUN 防泄漏捕获的 v6 连接)若被强制走 IPv4-only 查询会报 ErrIPVersion 导致直连失败
+	if ip, err := netip.ParseAddr(host); err == nil {
+		ip = ip.Unmap()
+		return []netip.Addr{ip}, nil
+	}
+
 	if r != nil && r.Invalid() {
 		if DisableIPv6 {
 			return r.LookupIPv4(ctx, host)
@@ -164,11 +172,6 @@ func LookupIPWithResolver(ctx context.Context, host string, r Resolver) ([]netip
 		return r.LookupIP(ctx, host)
 	} else if DisableIPv6 {
 		return LookupIPv4WithResolver(ctx, host, r)
-	}
-
-	if ip, err := netip.ParseAddr(host); err == nil {
-		ip = ip.Unmap()
-		return []netip.Addr{ip}, nil
 	}
 
 	return SystemResolver.LookupIP(ctx, host)
