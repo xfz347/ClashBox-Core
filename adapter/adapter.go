@@ -10,10 +10,12 @@ import (
 	"time"
 
 	"github.com/metacubex/mihomo/common/atomic"
+	"github.com/metacubex/mihomo/common/convert"
 	"github.com/metacubex/mihomo/common/queue"
 	"github.com/metacubex/mihomo/common/utils"
 	"github.com/metacubex/mihomo/common/xsync"
 	"github.com/metacubex/mihomo/component/ca"
+	"github.com/metacubex/mihomo/component/tls"
 	C "github.com/metacubex/mihomo/constant"
 	"github.com/metacubex/mihomo/log"
 
@@ -21,6 +23,18 @@ import (
 )
 
 var UnifiedDelay = atomic.NewBool(false)
+
+var (
+	banStatus = map[int]bool{
+		http.StatusForbidden:          true, // 403
+		http.StatusMethodNotAllowed:   true, // 405
+		http.StatusMisdirectedRequest: true, // 421
+		http.StatusNotImplemented:     true, // 501
+		http.StatusServiceUnavailable: true, // 503
+		520:                           true, // Cloudflare 520
+		599:                           true, // timeout
+	}
+)
 
 const (
 	defaultHistoriesNum = 10
@@ -311,4 +325,118 @@ func urlToMetadata(rawURL string) (addr C.Metadata, err error) {
 
 	err = addr.SetRemoteAddress(net.JoinHostPort(u.Hostname(), port))
 	return
+}
+
+func (p *Proxy) StatusTest(ctx context.Context, rawURL string) (status uint16, ok bool, err error) {
+	if _, err = urlToMetadata(rawURL); err != nil {
+		return 1, false, err
+	}
+
+	tlsConfig, err := ca.GetTLSConfig(ca.Option{})
+	if err != nil {
+		return 1, false, err
+	}
+
+	preset := convert.RandBrowserPreset()
+	fingerprint, ok2 := tls.GetFingerprint(preset.FingerprintName)
+	if !ok2 {
+		return 1, false, fmt.Errorf("failed to get TLS fingerprint: %s", preset.FingerprintName)
+	}
+
+	// Resolve the target per hop instead of pinning the one from rawURL: redirects
+	// may point at another host, and every hop has to be dialed through the proxy.
+	dialProxy := func(dialCtx context.Context, targetAddr string) (net.Conn, error) {
+		var metadata C.Metadata
+		if err := metadata.SetRemoteAddress(targetAddr); err != nil {
+			return nil, err
+		}
+		return p.DialContext(dialCtx, &metadata)
+	}
+
+	// force ForceAttemptHTTP2 to false and use BuildWebsocketHandshakeState to custom http1.1 type for clear status code detection
+	transport := &http.Transport{
+		MaxIdleConns:          100,
+		IdleConnTimeout:       90 * time.Second,
+		TLSHandshakeTimeout:   10 * time.Second,
+		ExpectContinueTimeout: 1 * time.Second,
+		ForceAttemptHTTP2:     false,
+		// DialContext is required even though the probe URL is https: on a redirect to
+		// a plain-http URL the Transport uses this hook, and when it is nil it silently
+		// falls back to its package-level zeroDialer, which resolves through
+		// net.DefaultResolver and trips the guard installed in main().
+		DialContext: func(dialCtx context.Context, network, targetAddr string) (net.Conn, error) {
+			return dialProxy(dialCtx, targetAddr)
+		},
+		DialTLSContext: func(dialCtx context.Context, network, targetAddr string) (net.Conn, error) {
+			serverName, _, splitErr := net.SplitHostPort(targetAddr)
+			if splitErr != nil {
+				return nil, splitErr
+			}
+			rawConn, err := dialProxy(dialCtx, targetAddr)
+			if err != nil {
+				return nil, err
+			}
+			uCfg := tls.UConfig(tlsConfig)
+			uCfg.ServerName = serverName
+			uConn := tls.UClient(rawConn, uCfg, fingerprint)
+			if err := tls.BuildWebsocketHandshakeState(uConn); err != nil {
+				_ = rawConn.Close()
+				return nil, err
+			}
+			if err := uConn.HandshakeContext(dialCtx); err != nil {
+				_ = rawConn.Close()
+				return nil, err
+			}
+			return uConn, nil
+		},
+	}
+
+	client := http.Client{
+		Timeout:   10 * time.Second,
+		Transport: transport,
+		CheckRedirect: func(req *http.Request, via []*http.Request) error {
+			if len(via) >= 3 {
+				return http.ErrUseLastResponse
+			}
+			return nil
+		},
+	}
+	defer client.CloseIdleConnections()
+
+	req, err := http.NewRequest(http.MethodGet, rawURL, nil)
+	if err != nil {
+		return 1, false, err
+	}
+	req = req.WithContext(ctx)
+	req.Header = preset.Headers.Clone()
+
+	resp, err := client.Do(req)
+	var statusCode int
+	if err != nil {
+		if netErr, okNet := err.(net.Error); okNet && netErr.Timeout() {
+			statusCode = 599
+		} else if err == context.Canceled || err == context.DeadlineExceeded {
+			statusCode = 599
+		} else {
+			return 1, false, err
+		}
+	} else {
+		statusCode = resp.StatusCode
+		ok = !banStatus[statusCode]
+		if !ok {
+			if statusCode == http.StatusForbidden {
+				if resp.Header.Get("Server") == "cloudflare" {
+					ok = true
+				}
+			}
+			if statusCode == 520 {
+				if resp.Header.Get("Server") != "cloudflare" {
+					ok = true
+				}
+			}
+		}
+		_ = resp.Body.Close()
+	}
+
+	return uint16(statusCode), ok, nil
 }
