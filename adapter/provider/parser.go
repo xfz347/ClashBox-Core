@@ -49,7 +49,7 @@ func ParseProxyProvider(name string, mapping map[string]any, tunnel C.Tunnel) (P
 
 	schema := &proxyProviderSchema{
 		HealthCheck: healthCheckSchema{
-			Lazy: true,
+			Lazy: false,
 		},
 	}
 	if err := decoder.Decode(mapping, schema); err != nil {
@@ -64,7 +64,7 @@ func ParseProxyProvider(name string, mapping map[string]any, tunnel C.Tunnel) (P
 	var hcInterval uint
 	if schema.HealthCheck.Enable {
 		if schema.HealthCheck.Interval == 0 {
-			schema.HealthCheck.Interval = 300
+			schema.HealthCheck.Interval = 120
 		}
 		hcInterval = uint(schema.HealthCheck.Interval)
 	}

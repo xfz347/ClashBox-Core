@@ -129,7 +129,8 @@ func (hc *HealthCheck) check() {
 		id := utils.NewUUIDV4().String()
 		log.Debugln("Start New Health Checking {%s}", id)
 		b := new(errgroup.Group)
-		b.SetLimit(10)
+		// ★ 10→20: 加速首轮检查完成(TUN up 主动触发后尽快产出 alive 节点, 消除兜底组黑洞窗口)
+		b.SetLimit(20)
 
 		// execute default health check
 		option := &extraOption{filters: nil, expectedStatus: hc.expectedStatus}

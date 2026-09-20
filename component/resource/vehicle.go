@@ -17,7 +17,7 @@ import (
 )
 
 const (
-	DefaultHttpTimeout = time.Second * 20
+	DefaultHttpTimeout = time.Second * 60
 
 	fileMode os.FileMode = 0o666
 	dirMode  os.FileMode = 0o755
