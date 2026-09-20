@@ -61,6 +61,7 @@ func (u *URLTest) DialContext(ctx context.Context, metadata *C.Metadata) (c C.Co
 		c.AppendToChains(u)
 	} else {
 		u.onDialFailed(proxy.Type(), err, u.healthCheck)
+		u.onDialFailedReset()
 	}
 
 	if N.NeedHandshake(c) {
@@ -69,6 +70,7 @@ func (u *URLTest) DialContext(ctx context.Context, metadata *C.Metadata) (c C.Co
 				u.onDialSuccess()
 			} else {
 				u.onDialFailed(proxy.Type(), err, u.healthCheck)
+				u.onDialFailedReset()
 			}
 		})
 	}
@@ -84,6 +86,7 @@ func (u *URLTest) ListenPacketContext(ctx context.Context, metadata *C.Metadata)
 		pc.AppendToChains(u)
 	} else {
 		u.onDialFailed(proxy.Type(), err, u.healthCheck)
+		u.onDialFailedReset()
 	}
 
 	return pc, err
@@ -97,6 +100,10 @@ func (u *URLTest) Unwrap(metadata *C.Metadata, touch bool) C.Proxy {
 func (u *URLTest) healthCheck() {
 	u.fastSingle.Reset()
 	u.GroupBase.healthCheck()
+	u.fastSingle.Reset()
+}
+
+func (u *URLTest) onDialFailedReset() {
 	u.fastSingle.Reset()
 }
 
@@ -210,7 +217,7 @@ func NewURLTest(option GroupCommonOption, urlTestOption URLTestOption, emptyFall
 			EmptyFallback:  emptyFallback,
 			Providers:      providers,
 		}),
-		fastSingle:     singledo.NewSingle[C.Proxy](time.Second * 10),
+		fastSingle:     singledo.NewSingle[C.Proxy](time.Second * 3),
 		disableUDP:     option.DisableUDP,
 		testUrl:        option.URL,
 		expectedStatus: option.ExpectedStatus,

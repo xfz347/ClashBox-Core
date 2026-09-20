@@ -5,12 +5,12 @@ import (
 	"io"
 	"net"
 	URL "net/url"
-	"runtime"
 	"strings"
 	"time"
 
 	"github.com/metacubex/mihomo/component/ca"
 	"github.com/metacubex/mihomo/component/dialer"
+	"github.com/metacubex/mihomo/constant/features"
 	C "github.com/metacubex/mihomo/constant"
 	"github.com/metacubex/mihomo/listener/inner"
 
@@ -69,10 +69,10 @@ func HttpRequest(ctx context.Context, url, method string, header map[string][]st
 
 	transport := &http.Transport{
 		// from http.DefaultTransport
-		DisableKeepAlives:     runtime.GOOS == "android",
+		DisableKeepAlives:     features.Android || features.OHOS,
 		MaxIdleConns:          100,
 		IdleConnTimeout:       30 * time.Second,
-		TLSHandshakeTimeout:   10 * time.Second,
+		TLSHandshakeTimeout:   30 * time.Second,
 		ExpectContinueTimeout: 1 * time.Second,
 		DialContext: func(ctx context.Context, network, address string) (net.Conn, error) {
 			if opt.dialer != nil {

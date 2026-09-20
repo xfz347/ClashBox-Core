@@ -92,10 +92,10 @@ func NewGroupBase(opt GroupBaseOption) *GroupBase {
 	}
 
 	if gb.testTimeout == 0 {
-		gb.testTimeout = 5000
+		gb.testTimeout = 10000
 	}
 	if gb.maxFailedTimes == 0 {
-		gb.maxFailedTimes = 5
+		gb.maxFailedTimes = 2
 	}
 
 	return gb
