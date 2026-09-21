@@ -137,7 +137,9 @@ func (p *path) MMDB() string {
 				strings.EqualFold(fi.Name(), "geoip.db") ||
 				strings.EqualFold(fi.Name(), "geoip.metadb") ||
 				strings.EqualFold(fi.Name(), "GEOIP.metadb") {
-				GeoipName = fi.Name()
+				// ★ 注意: 不能写 GeoipName! 该全局变量是 geodata-mode(protobuf)路径
+				// 专用文件名(GeoIP.dat), 被 LoadGeoIP/Verify 使用; 此处写入 mmdb 文件名
+				// 会污染 geodata 加载器, 导致 "proto: cannot parse invalid wire-format data"
 				return P.Join(p.homeDir, fi.Name())
 			}
 		}
