@@ -2,6 +2,7 @@ package geodata
 
 import (
 	"fmt"
+	"path/filepath"
 
 	"github.com/metacubex/mihomo/component/geodata/router"
 	C "github.com/metacubex/mihomo/constant"
@@ -16,7 +17,9 @@ func (l *loader) LoadGeoSite(list string) ([]*router.Domain, error) {
 }
 
 func (l *loader) LoadGeoIP(country string) ([]*router.CIDR, error) {
-	return l.LoadIPByPath(C.GeoipName, country)
+	// ★ 防御: 不直接使用全局 C.GeoipName(可能被过期状态污染),
+	// 每次通过 C.Path.GeoIP() 重新扫描获取实际存在的 GeoIP.dat 文件名
+	return l.LoadIPByPath(filepath.Base(C.Path.GeoIP()), country)
 }
 
 var loaders map[string]func() LoaderImplementation
