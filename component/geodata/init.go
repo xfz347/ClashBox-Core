@@ -2,7 +2,6 @@ package geodata
 
 import (
 	"context"
-	"fmt"
 	"io"
 	"os"
 	"sync"
@@ -69,7 +68,7 @@ func SetASNUrl(url string) {
 }
 
 func downloadToPath(url string, path string) (err error) {
-	ctx, cancel := context.WithTimeout(context.Background(), time.Second*90)
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second*15)
 	defer cancel()
 	resp, err := mihomoHttp.HttpRequest(ctx, url, http.MethodGet, nil, nil)
 	if err != nil {
@@ -87,27 +86,30 @@ func downloadToPath(url string, path string) (err error) {
 	return err
 }
 
+func asyncDownloadGeoResource(name, url, path string) {
+	log.Infoln("[GeoData] %s async download started", name)
+	if err := downloadToPath(url, path); err != nil {
+		log.Errorln("[GeoData] Can't download %s: %v", name, err)
+		return
+	}
+	log.Infoln("[GeoData] %s async download completed", name)
+}
+
 func InitGeoSite() error {
 	geoSiteEnable.Store(true)
 	initGeoSiteMutex.Lock()
 	defer initGeoSiteMutex.Unlock()
 	if _, err := os.Stat(C.Path.GeoSite()); os.IsNotExist(err) {
-		log.Infoln("Can't find GeoSite.dat, start download")
-		if err := downloadToPath(GeoSiteUrl(), C.Path.GeoSite()); err != nil {
-			return fmt.Errorf("can't download GeoSite.dat: %s", err.Error())
-		}
-		log.Infoln("Download GeoSite.dat finish")
-		initGeoSite = false
+		log.Infoln("[GeoData] GeoSite.dat not found, async download started")
+		go asyncDownloadGeoResource("GeoSite.dat", GeoSiteUrl(), C.Path.GeoSite())
+		return nil
 	}
 	if !initGeoSite {
 		if err := Verify(C.GeositeName); err != nil {
-			log.Warnln("GeoSite.dat invalid, remove and download: %s", err)
-			if err := os.Remove(C.Path.GeoSite()); err != nil {
-				return fmt.Errorf("can't remove invalid GeoSite.dat: %s", err.Error())
-			}
-			if err := downloadToPath(GeoSiteUrl(), C.Path.GeoSite()); err != nil {
-				return fmt.Errorf("can't download GeoSite.dat: %s", err.Error())
-			}
+			log.Warnln("GeoSite.dat invalid, remove and async download: %s", err)
+			_ = os.Remove(C.Path.GeoSite())
+			go asyncDownloadGeoResource("GeoSite.dat", GeoSiteUrl(), C.Path.GeoSite())
+			return nil
 		}
 		initGeoSite = true
 	}
@@ -120,23 +122,17 @@ func InitGeoIP() error {
 	defer initGeoIPMutex.Unlock()
 	if GeodataMode() {
 		if _, err := os.Stat(C.Path.GeoIP()); os.IsNotExist(err) {
-			log.Infoln("Can't find GeoIP.dat, start download")
-			if err := downloadToPath(GeoIpUrl(), C.Path.GeoIP()); err != nil {
-				return fmt.Errorf("can't download GeoIP.dat: %s", err.Error())
-			}
-			log.Infoln("Download GeoIP.dat finish")
-			initGeoIP = 0
+			log.Infoln("[GeoData] GeoIP.dat not found, async download started")
+			go asyncDownloadGeoResource("GeoIP.dat", GeoIpUrl(), C.Path.GeoIP())
+			return nil
 		}
 
 		if initGeoIP != 1 {
 			if err := Verify(C.GeoipName); err != nil {
-				log.Warnln("GeoIP.dat invalid, remove and download: %s", err)
-				if err := os.Remove(C.Path.GeoIP()); err != nil {
-					return fmt.Errorf("can't remove invalid GeoIP.dat: %s", err.Error())
-				}
-				if err := downloadToPath(GeoIpUrl(), C.Path.GeoIP()); err != nil {
-					return fmt.Errorf("can't download GeoIP.dat: %s", err.Error())
-				}
+				log.Warnln("GeoIP.dat invalid, remove and async download: %s", err)
+				_ = os.Remove(C.Path.GeoIP())
+				go asyncDownloadGeoResource("GeoIP.dat", GeoIpUrl(), C.Path.GeoIP())
+				return nil
 			}
 			initGeoIP = 1
 		}
@@ -144,21 +140,17 @@ func InitGeoIP() error {
 	}
 
 	if _, err := os.Stat(C.Path.MMDB()); os.IsNotExist(err) {
-		log.Infoln("Can't find MMDB, start download")
-		if err := downloadToPath(MmdbUrl(), C.Path.MMDB()); err != nil {
-			return fmt.Errorf("can't download MMDB: %s", err.Error())
-		}
+		log.Infoln("[GeoData] MMDB not found, async download started")
+		go asyncDownloadGeoResource("MMDB", MmdbUrl(), C.Path.MMDB())
+		return nil
 	}
 
 	if initGeoIP != 2 {
 		if !mmdb.Verify(C.Path.MMDB()) {
-			log.Warnln("MMDB invalid, remove and download")
-			if err := os.Remove(C.Path.MMDB()); err != nil {
-				return fmt.Errorf("can't remove invalid MMDB: %s", err.Error())
-			}
-			if err := downloadToPath(MmdbUrl(), C.Path.MMDB()); err != nil {
-				return fmt.Errorf("can't download MMDB: %s", err.Error())
-			}
+			log.Warnln("MMDB invalid, remove and async download")
+			_ = os.Remove(C.Path.MMDB())
+			go asyncDownloadGeoResource("MMDB", MmdbUrl(), C.Path.MMDB())
+			return nil
 		}
 		initGeoIP = 2
 	}
@@ -170,22 +162,16 @@ func InitASN() error {
 	initASNMutex.Lock()
 	defer initASNMutex.Unlock()
 	if _, err := os.Stat(C.Path.ASN()); os.IsNotExist(err) {
-		log.Infoln("Can't find ASN.mmdb, start download")
-		if err := downloadToPath(ASNUrl(), C.Path.ASN()); err != nil {
-			return fmt.Errorf("can't download ASN.mmdb: %s", err.Error())
-		}
-		log.Infoln("Download ASN.mmdb finish")
-		initASN = false
+		log.Infoln("[GeoData] ASN.mmdb not found, async download started")
+		go asyncDownloadGeoResource("ASN.mmdb", ASNUrl(), C.Path.ASN())
+		return nil
 	}
 	if !initASN {
 		if !mmdb.Verify(C.Path.ASN()) {
-			log.Warnln("ASN invalid, remove and download")
-			if err := os.Remove(C.Path.ASN()); err != nil {
-				return fmt.Errorf("can't remove invalid ASN: %s", err.Error())
-			}
-			if err := downloadToPath(ASNUrl(), C.Path.ASN()); err != nil {
-				return fmt.Errorf("can't download ASN: %s", err.Error())
-			}
+			log.Warnln("ASN invalid, remove and async download")
+			_ = os.Remove(C.Path.ASN())
+			go asyncDownloadGeoResource("ASN.mmdb", ASNUrl(), C.Path.ASN())
+			return nil
 		}
 		initASN = true
 	}
