@@ -69,7 +69,7 @@ func HttpRequest(ctx context.Context, url, method string, header map[string][]st
 
 	transport := &http.Transport{
 		// from http.DefaultTransport
-		DisableKeepAlives:     features.Android || features.OHOS,
+		DisableKeepAlives:     features.Android,
 		MaxIdleConns:          100,
 		IdleConnTimeout:       30 * time.Second,
 		TLSHandshakeTimeout:   30 * time.Second,
