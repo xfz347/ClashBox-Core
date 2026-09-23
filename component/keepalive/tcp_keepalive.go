@@ -6,7 +6,6 @@ import (
 	"time"
 
 	"github.com/metacubex/mihomo/common/atomic"
-	"github.com/metacubex/mihomo/constant/features"
 )
 
 var (
@@ -32,7 +31,7 @@ func KeepAliveInterval() time.Duration {
 }
 
 func SetDisableKeepAlive(disable bool) {
-	if runtime.GOOS == "android" || features.OHOS {
+	if runtime.GOOS == "android" {
 		setDisableKeepAlive(true)
 	} else {
 		setDisableKeepAlive(disable)
