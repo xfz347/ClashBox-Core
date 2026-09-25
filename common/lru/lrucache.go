@@ -3,6 +3,7 @@ package lru
 // Modified by https://github.com/die-net/lrucache
 
 import (
+	"strings"
 	"sync"
 	"time"
 
@@ -288,4 +289,67 @@ type entry[K comparable, V any] struct {
 	key     K
 	value   V
 	expires int64
+}
+
+func ResetLRU[K comparable, V any](oldCache *LruCache[K, V], newSize int, options ...Option[K, V]) *LruCache[K, V] {
+	newCache := New[K, V](append(options, WithSize[K, V](newSize))...)
+	oldCache.CloneTo(newCache)
+	return newCache
+}
+
+func (c *LruCache[K, V]) FilterByKeyPrefix(prefix string) map[string]V {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	result := make(map[string]V)
+	now := time.Now().Unix()
+
+	for k, le := range c.cache {
+		keyStr, ok := any(k).(string)
+		if !ok {
+			continue
+		}
+
+		if !strings.HasPrefix(keyStr, prefix) {
+			continue
+		}
+
+		if !c.staleReturn && c.maxAge > 0 && le.Value.expires <= now {
+			c.deleteElement(le)
+			continue
+		}
+
+		e := le.Value
+		result[keyStr] = e.value
+	}
+
+	c.maybeDeleteOldest()
+
+	return result
+}
+
+func (c *LruCache[K, V]) RemoveByKeyPrefix(prefix string) int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	var removed int
+	var keysToRemove []K
+
+	for k := range c.cache {
+		keyStr, ok := any(k).(string)
+		if !ok {
+			continue
+		}
+
+		if strings.HasPrefix(keyStr, prefix) {
+			keysToRemove = append(keysToRemove, k)
+		}
+	}
+
+	for _, k := range keysToRemove {
+		c.delete(k)
+		removed++
+	}
+
+	return removed
 }
