@@ -97,6 +97,9 @@ func NewGroupBase(opt GroupBaseOption) *GroupBase {
 	if gb.maxFailedTimes == 0 {
 		gb.maxFailedTimes = 2
 	}
+	if gb.maxFailedTimes == 0 {
+		gb.maxFailedTimes = 2
+	}
 
 	return gb
 }
@@ -279,6 +282,7 @@ func (gb *GroupBase) onDialFailed(adapterType C.AdapterType, err error, fn func(
 
 		var trigger bool
 		gb.failedTestMux.Lock()
+
 		gb.failedTimes++
 		if gb.failedTimes == 1 {
 			log.Debugln("ProxyGroup: %s first failed", gb.Name())
@@ -305,12 +309,11 @@ func (gb *GroupBase) onDialFailed(adapterType C.AdapterType, err error, fn func(
 }
 
 func (gb *GroupBase) healthCheck() {
-	// CAS so that only one goroutine actually runs the health check even when
-	// several onDialFailed goroutines trip it at the same time.
-	if !gb.failedTesting.CompareAndSwap(false, true) {
+	if gb.failedTesting.Load() {
 		return
 	}
 
+	gb.failedTesting.Store(true)
 	wg := sync.WaitGroup{}
 	for _, proxyProvider := range gb.providers {
 		wg.Add(1)
@@ -322,18 +325,12 @@ func (gb *GroupBase) healthCheck() {
 	}
 
 	wg.Wait()
-
 	gb.failedTesting.Store(false)
-	gb.failedTestMux.Lock()
 	gb.failedTimes = 0
-	gb.failedTestMux.Unlock()
 }
 
 func (gb *GroupBase) onDialSuccess() {
-	if gb.failedTesting.Load() {
-		return
+	if !gb.failedTesting.Load() {
+		gb.failedTimes = 0
 	}
-	gb.failedTestMux.Lock()
-	gb.failedTimes = 0
-	gb.failedTestMux.Unlock()
 }
