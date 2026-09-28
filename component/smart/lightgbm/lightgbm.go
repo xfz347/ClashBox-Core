@@ -436,45 +436,38 @@ func GetModel() *WeightModel {
 
         if _, err := os.Stat(modelPath); err == nil {
             if err := m.loadModel(modelPath); err != nil {
-                log.Warnln("[Smart] Model.bin invalid, remove and download: %v", err)
+                log.Warnln("[Smart] Model.bin invalid, will async download: %v", err)
                 if rmErr := os.Remove(modelPath); rmErr != nil {
                     log.Errorln("[Smart] Failed to remove invalid Model.bin: %v", rmErr)
                     return
                 }
-
-                if downloadErr := downloadModel(modelPath); downloadErr != nil {
-                    log.Errorln("[Smart] Failed to download Model.bin: %v", downloadErr)
-                    return
-                }
-
-                if reloadErr := m.loadModel(modelPath); reloadErr != nil {
-                    log.Errorln("[Smart] Failed to load downloaded Model.bin: %v", reloadErr)
-                    return
-                }
-
-                log.Infoln("[Smart] Model.bin downloaded and loaded successfully")
+                go asyncDownloadAndLoad(m, modelPath)
             } else {
                 log.Infoln("[Smart] Model file loaded successfully")
+                smartModel = m
             }
         } else {
-            log.Infoln("[Smart] Can't find Model.bin, start download")
-            if downloadErr := downloadModel(modelPath); downloadErr != nil {
-                log.Errorln("[Smart] Can't download Model.bin: %v", downloadErr)
-                return
-            }
-
-            if loadErr := m.loadModel(modelPath); loadErr != nil {
-                log.Errorln("[Smart] Failed to load downloaded Model.bin: %v", loadErr)
-                return
-            }
-
-            log.Infoln("[Smart] Download Model.bin finish")
+            log.Infoln("[Smart] Can't find Model.bin, async download started")
+            go asyncDownloadAndLoad(m, modelPath)
         }
-
-        smartModel = m
     })
 
     return smartModel
+}
+
+func asyncDownloadAndLoad(m *WeightModel, modelPath string) {
+    if downloadErr := downloadModel(modelPath); downloadErr != nil {
+        log.Errorln("[Smart] Can't download Model.bin: %v", downloadErr)
+        return
+    }
+
+    if loadErr := m.loadModel(modelPath); loadErr != nil {
+        log.Errorln("[Smart] Failed to load downloaded Model.bin: %v", loadErr)
+        return
+    }
+
+    smartModel = m
+    log.Infoln("[Smart] Model.bin async download and load completed")
 }
 
 func (m *WeightModel) loadModel(path string) error {
@@ -548,7 +541,7 @@ func downloadModel(path string) (err error) {
 		modelUrl = GetModelDownloadURL()
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), time.Second*90)
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second*15)
 	defer cancel()
 
 	resp, err := mihomoHttp.HttpRequest(ctx, modelUrl, http.MethodGet, nil, nil)

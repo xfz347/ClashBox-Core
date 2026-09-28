@@ -26,9 +26,24 @@ func (d *Direct) DialContext(ctx context.Context, metadata *C.Metadata) (C.Conn,
 		return nil, err
 	}
 	opts := d.DialOptions()
-	opts = append(opts, dialer.WithResolver(resolver.DirectHostResolver))
+	directResolver := resolver.DirectHostResolver
+	opts = append(opts, dialer.WithResolver(directResolver))
 	c, err := dialer.DialContext(ctx, "tcp", metadata.RemoteAddress(), opts...)
 	if err != nil {
+		// ★ DirectHostResolver 回退到 DefaultResolver 时, DNS 查询可能走
+		// respect-rules 被路由到不通的代理节点导致解析失败。
+		// 兜底: 用系统 DNS 再解析一次, 确保 DIRECT 出站不受代理节点影响。
+		if directResolver != nil && directResolver == resolver.DefaultResolver && metadata.Host != "" {
+			ip, resolveErr := resolver.SystemResolver.LookupIP(ctx, metadata.Host)
+			if resolveErr == nil && len(ip) > 0 {
+				metadata.DstIP = ip[0]
+				opts2 := d.DialOptions()
+				c2, dialErr := dialer.DialContext(ctx, "tcp", metadata.RemoteAddress(), opts2...)
+				if dialErr == nil {
+					return d.loopBack.NewConn(NewConn(c2, d)), nil
+				}
+			}
+		}
 		return nil, err
 	}
 	return d.loopBack.NewConn(NewConn(c, d)), nil
@@ -53,6 +68,12 @@ func (d *Direct) ResolveUDP(ctx context.Context, metadata *C.Metadata) error {
 	if (!metadata.Resolved() || resolver.DirectHostResolver != resolver.DefaultResolver) && metadata.Host != "" {
 		ip, err := resolveIPWithResolver(ctx, metadata.Host, d.prefer, resolver.DirectHostResolver)
 		if err != nil {
+			if resolver.DirectHostResolver == resolver.DefaultResolver {
+				if sysIP, sysErr := resolver.SystemResolver.LookupIP(ctx, metadata.Host); sysErr == nil && len(sysIP) > 0 {
+					metadata.DstIP = sysIP[0]
+					return nil
+				}
+			}
 			return fmt.Errorf("can't resolve ip: %w", err)
 		}
 		metadata.DstIP = ip

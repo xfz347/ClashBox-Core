@@ -138,10 +138,15 @@ func (f *Fallback) Set(name string) error {
 
 	f.selected = name
 	if !p.AliveForTestUrl(f.testUrl) {
-		ctx, cancel := context.WithTimeout(context.Background(), time.Millisecond*time.Duration(5000))
-		defer cancel()
-		expectedStatus, _ := utils.NewUnsignedRanges[uint16](f.expectedStatus)
-		_, _ = p.URLTest(ctx, f.testUrl, expectedStatus)
+		// ★ 无健康缓存时后台补测, 不阻塞切换 RPC:
+		// 原同步 URLTest 最长 5s, 冷启动/测速过期后切换 fallback 节点必然卡 5s(UI 转圈)。
+		// selected 已设置, findAliveProxy 会校验健康性, 后台测速完成前按原语义回退自动选择。
+		go func() {
+			ctx, cancel := context.WithTimeout(context.Background(), time.Millisecond*time.Duration(5000))
+			defer cancel()
+			expectedStatus, _ := utils.NewUnsignedRanges[uint16](f.expectedStatus)
+			_, _ = p.URLTest(ctx, f.testUrl, expectedStatus)
+		}()
 	}
 
 	return nil

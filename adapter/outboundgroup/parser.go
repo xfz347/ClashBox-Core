@@ -49,7 +49,7 @@ func ParseProxyGroup(config map[string]any, proxyMap map[string]C.Proxy, provide
 	decoder := structure.NewDecoder(structure.Option{TagName: "group", WeaklyTypedInput: true})
 
 	groupOption := GroupCommonOption{
-		Lazy: true,
+		Lazy: false,
 	}
 	if err := decoder.Decode(config, &groupOption); err != nil {
 		return nil, errFormat
@@ -169,7 +169,7 @@ func ParseProxyGroup(config map[string]any, proxyMap map[string]C.Proxy, provide
 		// select don't need auto health check
 		if groupOption.Type != "select" && groupOption.Type != "relay" {
 			if groupOption.Interval == 0 {
-				groupOption.Interval = 300
+				groupOption.Interval = 120
 			}
 		}
 
