@@ -30,7 +30,14 @@ func DialQuic(ctx context.Context, address string, opts []dialer.Option, pDialer
 				return nil, err
 			}
 			udpAddr := net.UDPAddrFromAddrPort(addrPort)
-			packetConn, err := pDialer.ListenPacket(ctx, "udp", "", udpAddr.AddrPort())
+			// ★ 修复: 强制按目标地址族选 udp4/udp6, 不再用 "udp" 建双栈(udp6) socket。
+			// OHOS vpnConnection.protect(fd) 对双栈未连接 UDP socket 不生效(流量回环),
+			// 而 TCP 用 tcp4 正常。IPv4 目标用 udp4, 与 TCP 行为对齐。
+			udpNetwork := "udp4"
+			if addrPort.Addr().Is6() && !addrPort.Addr().Is4In6() {
+				udpNetwork = "udp6"
+			}
+			packetConn, err := pDialer.ListenPacket(ctx, udpNetwork, "", udpAddr.AddrPort())
 			if err != nil {
 				return nil, err
 			}
