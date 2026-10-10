@@ -149,7 +149,10 @@ func Status() TunnelStatus {
 }
 
 func SetSniffing(b bool) {
-	if snifferDispatcher.Enable() {
+	configMux.RLock()
+	enabled := snifferDispatcher != nil && snifferDispatcher.Enable()
+	configMux.RUnlock()
+	if enabled {
 		configMux.Lock()
 		sniffingEnable = b
 		configMux.Unlock()
@@ -157,7 +160,10 @@ func SetSniffing(b bool) {
 }
 
 func IsSniffing() bool {
-	return sniffingEnable
+	configMux.RLock()
+	b := sniffingEnable
+	configMux.RUnlock()
+	return b
 }
 
 // TCPIn return fan-in queue
@@ -455,8 +461,12 @@ func handleUDPConn(packet C.PacketAdapter) {
 	key := packet.Key()
 	sender, loaded := natTable.GetOrCreate(key, func() C.PacketSender {
 		sender := newPacketSender()
-		if sniffingEnable && snifferDispatcher.Enable() {
-			return snifferDispatcher.UDPSniff(packet, sender)
+		configMux.RLock()
+		sniffEnabled := sniffingEnable
+		dispatcher := snifferDispatcher
+		configMux.RUnlock()
+		if sniffEnabled && dispatcher != nil && dispatcher.Enable() {
+			return dispatcher.UDPSniff(packet, sender)
 		}
 		return sender
 	})
@@ -539,10 +549,12 @@ func handleTCPConn(connCtx C.ConnContext) {
 
 	conn := connCtx.Conn()
 	conn.ResetPeeked() // reset before sniffer
-	if sniffingEnable && snifferDispatcher.Enable() {
-		// Try to sniff a domain when `preHandleMetadata` failed, this is usually
-		// caused by a "Fake DNS record missing" error when enhanced-mode is fake-ip.
-		if snifferDispatcher.TCPSniff(conn, metadata) {
+	configMux.RLock()
+	sniffEnabled := sniffingEnable
+	dispatcher := snifferDispatcher
+	configMux.RUnlock()
+	if sniffEnabled && dispatcher != nil && dispatcher.Enable() {
+		if dispatcher.TCPSniff(conn, metadata) {
 			// we now have a domain name
 			preHandleFailed = false
 		}
