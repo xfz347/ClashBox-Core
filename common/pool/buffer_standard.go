@@ -2,7 +2,8 @@
 
 package pool
 
-const (
+// 说明: 改为 var 以便运行时通过 SetLowMemoryMode 切换(见 lowmemory_runtime.go)。
+var (
 	// RelayBufferSize using for tcp
 	// io.Copy default buffer size is 32 KiB
 	RelayBufferSize = 32 * 1024

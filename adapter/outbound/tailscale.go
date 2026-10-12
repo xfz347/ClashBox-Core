@@ -109,12 +109,39 @@ func init() {
 			return
 		})
 	}
+	// ★ OHOS: 沙箱无 netlink 权限, 注册不依赖 netlink 的接口获取器, 避免 tsnet 初始化失败
+	if ohosPatchInterfaceGetter {
+		registerOhosInterfaceGetter()
+	}
 }
 
 func NewTailscale(option TailscaleOption) (*Tailscale, error) {
 	if _, err := buildTailscaleMaskedPrefs(option); err != nil {
 		return nil, err
 	}
+	// ★ 诊断: 打印解析后的关键选项(accept-routes/exit-node 是否生效)
+	ar := "unset"
+	if option.AcceptRoutes != nil {
+		if *option.AcceptRoutes {
+			ar = "true"
+		} else {
+			ar = "false"
+		}
+	}
+	lanAcc := "unset"
+	if option.ExitNodeAllowLANAccess != nil {
+		if *option.ExitNodeAllowLANAccess {
+			lanAcc = "true"
+		} else {
+			lanAcc = "false"
+		}
+	}
+	akState := "empty"
+	if option.AuthKey != "" {
+		akState = "set"
+	}
+	log.Debugln("[Tailscale](%s) 选项: hostname=%q stateDir=%q acceptRoutes=%s authKey=%s exitNode=%q exitNodeAllowLAN=%s controlURL=%q ephemeral=%v udp=%v",
+		option.Name, option.Hostname, option.StateDir, ar, akState, option.ExitNode, lanAcc, option.ControlURL, option.Ephemeral, option.UDP)
 	if option.StateDir == "" {
 		option.StateDir = "tailscale"
 	}
@@ -174,12 +201,19 @@ func NewTailscale(option TailscaleOption) (*Tailscale, error) {
 			log.Infoln("[Tailscale](%s) %s", option.Name, fmt.Sprintf(format, args...))
 		},
 		Logf: func(format string, args ...any) {
-			log.Debugln("[Tailscale](%s) %s", option.Name, fmt.Sprintf(format, args...))
+			log.Infoln("[Tailscale](%s) %s", option.Name, fmt.Sprintf(format, args...))
 		},
 	}
 	dnsTransport := tailscaleDNSTransport{tailscale: outbound}
 	outbound.dnsResolver = dns.NewResolverFromClient(dnsTransport)
 	outbound.unregisterDNSResolver = dns.RegisterTailscaleDnsClient(option.Name, dnsTransport)
+	// ★ 立即在后台启动 tsnet(而非等首次拨号), 便于尽早完成登录注册并暴露诊断日志
+	go func() {
+		outbound.controlConnectivitySelfTest()
+		if err := outbound.start(); err != nil {
+			log.Warnln("[Tailscale](%s) 后台启动失败: %v", option.Name, err)
+		}
+	}()
 	return outbound, nil
 }
 
@@ -199,6 +233,7 @@ func (t *Tailscale) start() error {
 			return
 		}
 		go t.watchBackendState()
+		go t.statusProbeLoop()
 	})
 	return t.startErr
 }
@@ -210,8 +245,66 @@ func (t *Tailscale) ensureStarted(ctx context.Context) error {
 	return t.waitBackendInitialized(ctx)
 }
 
-func (t *Tailscale) watchBackendState() {
-	lc, err := t.server.LocalClient()
+// statusProbeLoop 每 60s 打印一次 tailscale 后端状态, 便于在日志中随时看到当前状态
+// (NeedsLogin / Stopped / Running) 与已发现节点数, 定位"无法访问内网"类问题。
+func (t *Tailscale) statusProbeLoop() {
+	tk := time.NewTicker(120 * time.Second)
+	defer tk.Stop()
+	for {
+		select {
+		case <-t.ctx.Done():
+			return
+		case <-tk.C:
+			lc, err := t.server.LocalClient()
+			if err != nil {
+				log.Debugln("[Tailscale](%s) 状态巡检失败(LocalClient): %v", t.Name(), err)
+				continue
+			}
+			st, err := lc.Status(t.ctx)
+			if err != nil {
+				log.Debugln("[Tailscale](%s) 状态巡检失败(Status): %v", t.Name(), err)
+				continue
+			}
+			selfIPs := ""
+			if st.Self != nil {
+				selfIPs = fmt.Sprintf("%v", st.Self.TailscaleIPs)
+			}
+			log.Infoln("[Tailscale](%s) 状态巡检: state=%s peers=%d self=%s", t.Name(), st.BackendState, len(st.Peer), selfIPs)
+			if len(st.Health) > 0 {
+				n := len(st.Health)
+				if n > 5 {
+					n = 5
+				}
+				for i := 0; i < n; i++ {
+					log.Warnln("[Tailscale](%s) 健康: %s", t.Name(), st.Health[i])
+				}
+			}
+			if st.AuthURL != "" {
+				log.Warnln("[Tailscale](%s) 需要授权登录, 请在浏览器打开完成授权: %s", t.Name(), st.AuthURL)
+			}
+			if st.BackendState != "Running" {
+				log.Warnln("[Tailscale](%s) 未就绪(state=%s): 若为 NeedsLogin 请在出站配置填写 auth-key; 未运行则无法访问 tailnet/子网路由", t.Name(), st.BackendState)
+			}
+		}
+	}
+}
+
+// controlConnectivitySelfTest 自检: 经内核 dialer 拨 controlplane.tailscale.com:443,
+// 结果直接反映"控制面是否可达"(登录必须依赖此链路)。
+func (t *Tailscale) controlConnectivitySelfTest() {
+	ctx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
+	defer cancel()
+	target := "controlplane.tailscale.com:443"
+	conn, err := t.dialer.DialContext(ctx, "tcp", target)
+	if err != nil {
+		log.Warnln("[Tailscale](%s) 控制面连通性自检失败(%s): %v", t.Name(), target, err)
+		return
+	}
+	_ = conn.Close()
+	log.Infoln("[Tailscale](%s) 控制面连通性自检成功(%s)", t.Name(), target)
+}
+
+func (t *Tailscale) watchBackendState() {	lc, err := t.server.LocalClient()
 	if err != nil {
 		t.setBackendInitialized(err)
 		return
@@ -233,6 +326,10 @@ func (t *Tailscale) watchBackendState() {
 		}
 		if n.State == nil {
 			continue
+		}
+		log.Infoln("[Tailscale](%s) 后端状态: %v", t.Name(), *n.State)
+		if *n.State == ipn.NeedsLogin {
+			log.Warnln("[Tailscale](%s) 节点未登录(NeedsLogin): 请在出站配置中填写 auth-key(在 Tailscale 后台 Settings→Keys 生成)后重载配置, 否则无法访问 tailnet/子网路由", t.Name())
 		}
 
 		if *n.State != ipn.NoState && !backendInitialized {
@@ -277,6 +374,8 @@ func (t *Tailscale) applyPrefs(ctx context.Context) error {
 	if mp == nil {
 		return nil
 	}
+	log.Debugln("[Tailscale](%s) 应用偏好: routeAll=%v(set=%v) exitNode=%q autoExitNode=%q allowLan=%v",
+		t.Name(), mp.RouteAll, mp.RouteAllSet, t.option.ExitNode, mp.AutoExitNode, mp.ExitNodeAllowLANAccess)
 	lc, err := t.server.LocalClient()
 	if err != nil {
 		return err
