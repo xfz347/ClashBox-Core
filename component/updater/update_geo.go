@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"math/rand"
 	"os"
 	"runtime"
 	"time"
@@ -257,6 +258,8 @@ func RegisterGeoUpdater() {
 		}
 
 		for range ticker.C {
+			// 错峰: 随机延迟 0~10 分钟, 避免与其他定时更新任务同刻并发造成 CPU/网络尖峰
+			time.Sleep(time.Duration(rand.Intn(600)) * time.Second)
 			log.Infoln("[GEO] updating database every %d hours", updateInterval)
 			if err := UpdateGeoDatabases(); err != nil {
 				log.Errorln("[GEO] Failed to update GEO database: %s", err.Error())

@@ -673,6 +673,12 @@ func logMetadataErr(metadata *C.Metadata, rule C.Rule, proxy C.ProxyAdapter, err
 }
 
 func logMetadata(metadata *C.Metadata, rule C.Rule, remoteConn C.Connection) {
+	// 级别守卫: 当前级别高于 INFO(warning/error/silent)时直接返回,
+	// 跳过 SourceDetail/RemoteAddress/Chains 等每连接 eager 字符串构造,
+	// 消除高频连接场景下的字符串分配(GC 压力)与无效日志拼接开销
+	if log.Level() > log.INFO {
+		return
+	}
 	switch {
 	case metadata.SpecialProxy != "":
 		log.Infoln("[%s] %s --> %s using %s", strings.ToUpper(metadata.NetWork.String()), metadata.SourceDetail(), metadata.RemoteAddress(), remoteConn.Chains().String())
