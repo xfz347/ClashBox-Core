@@ -2,6 +2,7 @@ package statistic
 
 import (
 	"os"
+	"sync"
 	"time"
 
 	"github.com/metacubex/mihomo/common/atomic"
@@ -9,39 +10,42 @@ import (
 	"github.com/metacubex/mihomo/component/memory"
 )
 
+// snapshotCacheTTL 快照缓存时间窗: 同窗口内重复请求(连接页/代理页/web UI)直接复用,
+// 避免每次全量遍历 tracker 构造连接列表造成 CPU 尖峰
+const snapshotCacheTTL = 500 * time.Millisecond
+
 var DefaultManager *Manager
 
 func init() {
 	DefaultManager = &Manager{
-		uploadTemp:    atomic.NewInt64(0),
-		downloadTemp:  atomic.NewInt64(0),
-		uploadBlip:    atomic.NewInt64(0),
-		downloadBlip:  atomic.NewInt64(0),
 		uploadTotal:   atomic.NewInt64(0),
 		downloadTotal: atomic.NewInt64(0),
 		pid:           int32(os.Getpid()),
 	}
-
-	go DefaultManager.handle()
+	DefaultManager.lastTrafficAt.Store(time.Now().Unix())
 }
 
 type Manager struct {
-	connections   xsync.Map[string, Tracker]
-	smartTarget   xsync.Map[string, *xsync.Map[string, bool]]
-	uploadTemp    atomic.Int64
-	downloadTemp  atomic.Int64
-	uploadBlip    atomic.Int64
-	downloadBlip  atomic.Int64
-	uploadTotal   atomic.Int64
-	downloadTotal atomic.Int64
-	proxyUploadTemp    atomic.Int64
-	proxyDownloadTemp  atomic.Int64
-	proxyUploadBlip    atomic.Int64
-	proxyDownloadBlip  atomic.Int64
+	connections        xsync.Map[string, Tracker]
+	smartTarget        xsync.Map[string, *xsync.Map[string, bool]]
+	uploadTotal        atomic.Int64
+	downloadTotal      atomic.Int64
 	proxyUploadTotal   atomic.Int64
 	proxyDownloadTotal atomic.Int64
-	pid           int32
-	memory        uint64
+	lastTrafficAt      atomic.Int64 // 最近一次流量打点(unix 秒), 供空闲降频判断
+	pid                int32
+	memory             uint64
+
+	rateMu            sync.Mutex
+	rateBaseAt        time.Time // 速率差分基准时间
+	rateBaseUp        int64     // 基准 uploadTotal
+	rateBaseDown      int64
+	rateBaseProxyUp   int64
+	rateBaseProxyDown int64
+
+	snapshotMu    sync.Mutex
+	snapshotCache *Snapshot
+	snapshotAt    time.Time
 }
 
 func (m *Manager) Join(c Tracker) {
@@ -72,24 +76,32 @@ func (m *Manager) Range(f func(c Tracker) bool) {
 
 func (m *Manager) PushUploaded(lastChain string, size int64) {
 	if lastChain != "DIRECT" {
-		m.proxyUploadTemp.Add(size)
 		m.proxyUploadTotal.Add(size)
 	}
-	m.uploadTemp.Add(size)
 	m.uploadTotal.Add(size)
+	m.lastTrafficAt.Store(time.Now().Unix())
 }
 
 func (m *Manager) PushDownloaded(lastChain string, size int64) {
 	if lastChain != "DIRECT" {
-		m.proxyDownloadTemp.Add(size)
 		m.proxyDownloadTotal.Add(size)
 	}
-	m.downloadTemp.Add(size)
 	m.downloadTotal.Add(size)
+	m.lastTrafficAt.Store(time.Now().Unix())
 }
 
+// LastTrafficAt 返回最近一次流量打点时间, 用于空闲判断
+func (m *Manager) LastTrafficAt() time.Time {
+	sec := m.lastTrafficAt.Load()
+	if sec <= 0 {
+		return time.Now()
+	}
+	return time.Unix(sec, 0)
+}
+
+// Now 返回当前上下行速率(字节/秒)。读时差分计算, 见 NowTraffic
 func (m *Manager) Now() (up int64, down int64) {
-	return m.uploadBlip.Load(), m.downloadBlip.Load()
+	return m.NowTraffic(false)
 }
 
 func (m *Manager) Total() (up, down int64) {
@@ -102,17 +114,25 @@ func (m *Manager) Memory() uint64 {
 }
 
 func (m *Manager) Snapshot() *Snapshot {
+	m.snapshotMu.Lock()
+	defer m.snapshotMu.Unlock()
+	if m.snapshotCache != nil && time.Since(m.snapshotAt) < snapshotCacheTTL {
+		return m.snapshotCache
+	}
 	var connections []*TrackerInfo
 	m.Range(func(c Tracker) bool {
 		connections = append(connections, c.Info())
 		return true
 	})
-	return &Snapshot{
+	snapshot := &Snapshot{
 		UploadTotal:   m.uploadTotal.Load(),
 		DownloadTotal: m.downloadTotal.Load(),
 		Connections:   connections,
 		Memory:        m.memory,
 	}
+	m.snapshotCache = snapshot
+	m.snapshotAt = time.Now()
+	return snapshot
 }
 
 func (m *Manager) updateMemory() {
@@ -124,31 +144,20 @@ func (m *Manager) updateMemory() {
 }
 
 func (m *Manager) ResetStatistic() {
-	m.uploadTemp.Store(0)
-	m.uploadBlip.Store(0)
 	m.uploadTotal.Store(0)
-	m.downloadTemp.Store(0)
-	m.downloadBlip.Store(0)
 	m.downloadTotal.Store(0)
-
-	m.proxyUploadTemp.Store(0)
-	m.proxyUploadBlip.Store(0)
 	m.proxyUploadTotal.Store(0)
-	m.proxyDownloadTemp.Store(0)
-	m.proxyDownloadBlip.Store(0)
 	m.proxyDownloadTotal.Store(0)
 
-}
+	m.rateMu.Lock()
+	m.rateBaseAt = time.Now()
+	m.rateBaseUp, m.rateBaseDown = 0, 0
+	m.rateBaseProxyUp, m.rateBaseProxyDown = 0, 0
+	m.rateMu.Unlock()
 
-func (m *Manager) handle() {
-	ticker := time.NewTicker(time.Second)
-
-	for range ticker.C {
-		m.uploadBlip.Store(m.uploadTemp.Swap(0))
-		m.downloadBlip.Store(m.downloadTemp.Swap(0))
-		m.proxyUploadBlip.Store(m.proxyUploadTemp.Swap(0))
-		m.proxyDownloadBlip.Store(m.proxyDownloadTemp.Swap(0))
-	}
+	m.snapshotMu.Lock()
+	m.snapshotCache = nil
+	m.snapshotMu.Unlock()
 }
 
 type Snapshot struct {
@@ -203,4 +212,3 @@ func (m *Manager) RangeSmartTarget(target string, fn func(id string) bool) {
 		})
 	}
 }
-
