@@ -12,6 +12,7 @@ import (
 	"net/netip"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/metacubex/mihomo/common/atomic"
@@ -46,6 +47,12 @@ type Masque struct {
 	runLock   *semaphore.Weighted
 	running   atomic.Bool
 	runDevice atomic.Bool
+
+	stackMu   sync.Mutex
+	runStopMu sync.Mutex
+	runStop   context.CancelFunc
+	stackMTU  uint32
+	sessionUse stackSessionUse
 
 	option MasqueOption
 }
@@ -219,6 +226,7 @@ func NewMasque(option MasqueOption) (*Masque, error) {
 	if mtu == 0 {
 		mtu = 1280
 	}
+	outbound.stackMTU = uint32(mtu)
 
 	var has6 bool
 	if l4proxy {
@@ -236,13 +244,12 @@ func NewMasque(option MasqueOption) (*Masque, error) {
 		if len(prefixes) == 0 {
 			return nil, errors.New("missing local address")
 		}
-		outbound.tunDevice, err = newIPStack(option.IPStack, prefixes, uint32(mtu))
-		if err != nil {
-			return nil, fmt.Errorf("create device: %w", err)
+		if ipStackMayRefuse(prefixes, outbound.stackMTU) {
+			return nil, errIPStackRefused
 		}
 
 		for _, address := range prefixes {
-			if !address.Addr().Unmap().Is4() {
+			if !address.Addr().Is4() {
 				has6 = true
 				break
 			}
@@ -260,6 +267,14 @@ func NewMasque(option MasqueOption) (*Masque, error) {
 		outbound.resolver = dns.NewResolver(dns.Config{
 			Main: nss,
 			IPv6: has6,
+		})
+	}
+
+	if !l4proxy {
+		registerLazyStack(&lazyStackEntry{
+			name:     option.Name,
+			lastUsed: outbound.sessionUse.lastUsed,
+			release:  outbound.ReleaseSessions,
 		})
 	}
 
@@ -331,8 +346,24 @@ func (w *Masque) run(ctx context.Context) error {
 }
 
 func (w *Masque) startLocked(ctx context.Context) error {
+	w.stackMu.Lock()
+	if w.tunDevice == nil {
+		prefixes, err := w.option.Prefixes()
+		if err != nil {
+			w.stackMu.Unlock()
+			return err
+		}
+		device, err := newIPStack(w.option.IPStack, prefixes, w.stackMTU)
+		if err != nil {
+			w.stackMu.Unlock()
+			return fmt.Errorf("create device: %w", err)
+		}
+		w.tunDevice = device
+	}
+	tunDevice := w.tunDevice
+	w.stackMu.Unlock()
 	if !w.runDevice.Load() {
-		err := w.tunDevice.Start()
+		err := tunDevice.Start()
 		if err != nil {
 			return err
 		}
@@ -365,6 +396,9 @@ func (w *Masque) startLocked(ctx context.Context) error {
 	w.running.Store(true)
 
 	runCtx, runCancel := context.WithCancel(w.runCtx)
+	w.runStopMu.Lock()
+	w.runStop = runCancel
+	w.runStopMu.Unlock()
 	contextutils.AfterFunc(runCtx, func() {
 		w.running.Store(false)
 		_ = ipConn.Close()
@@ -381,7 +415,7 @@ func (w *Masque) startLocked(ctx context.Context) error {
 		bufs := [][]byte{buf}
 		sizes := []int{0}
 		for runCtx.Err() == nil {
-			_, err := w.tunDevice.Read(bufs, sizes, 0)
+			_, err := tunDevice.Read(bufs, sizes, 0)
 			if err != nil {
 				log.Errorln("[Masque](%s) error reading from TUN device: %v", w.name, err)
 				return
@@ -397,7 +431,7 @@ func (w *Masque) startLocked(ctx context.Context) error {
 			}
 
 			if len(icmp) > 0 {
-				if _, err := w.tunDevice.Write([][]byte{icmp}, 0); err != nil {
+				if _, err := tunDevice.Write([][]byte{icmp}, 0); err != nil {
 					log.Warnln("[Masque](%s) error writing ICMP to TUN device: %v, continuing...", w.name, err)
 				}
 			}
@@ -416,7 +450,7 @@ func (w *Masque) startLocked(ctx context.Context) error {
 				log.Warnln("[Masque](%s) error reading from IP connection: %v, continuing...", w.name, err)
 				continue
 			}
-			if _, err := w.tunDevice.Write([][]byte{buf}, 0); err != nil {
+			if _, err := tunDevice.Write([][]byte{buf}, 0); err != nil {
 				log.Errorln("[Masque](%s) error writing to TUN device: %v", w.name, err)
 				return
 			}
@@ -428,14 +462,63 @@ func (w *Masque) startLocked(ctx context.Context) error {
 
 // Close implements C.ProxyAdapter
 func (w *Masque) Close() error {
+	unregisterLazyStack(w.option.Name)
 	w.runCancel()
-	if w.tunDevice != nil {
-		w.tunDevice.Close()
+	w.stackMu.Lock()
+	device := w.tunDevice
+	w.tunDevice = nil
+	w.stackMu.Unlock()
+	if device != nil {
+		device.Close()
 	}
 	if w.l4Client != nil {
 		w.l4Client.Close()
 	}
 	return nil
+}
+
+// ReleaseSessions 空闲释放: 拆除 MASQUE 隧道与底层 netstack, 下次拨号重新握手建立。
+func (w *Masque) ReleaseSessions() bool {
+	if w.l4Client != nil {
+		return true
+	}
+	w.sessionUse.mu.Lock()
+	if w.sessionUse.dialing > 0 || w.sessionUse.conns > 0 {
+		w.sessionUse.mu.Unlock()
+		return false
+	}
+	tryCtx, cancel := context.WithTimeout(context.Background(), lazyStackRehandshakeGap)
+	defer cancel()
+	if err := w.runLock.Acquire(tryCtx, 1); err != nil {
+		w.sessionUse.mu.Unlock()
+		return false
+	}
+	defer w.runLock.Release(1)
+	w.stackMu.Lock()
+	device := w.tunDevice
+	if device == nil {
+		w.stackMu.Unlock()
+		w.sessionUse.mu.Unlock()
+		return true
+	}
+	w.tunDevice = nil
+	w.runDevice.Store(false)
+	w.stackMu.Unlock()
+	w.runStopMu.Lock()
+	stop := w.runStop
+	w.runStop = nil
+	w.runStopMu.Unlock()
+	w.sessionUse.mu.Unlock()
+
+	if stop != nil {
+		stop()
+		deadline := time.Now().Add(lazyStackReleaseSettle)
+		for w.running.Load() && time.Now().Before(deadline) {
+			time.Sleep(lazyStackSettlePollStep)
+		}
+	}
+	_ = device.Close()
+	return true
 }
 
 func (w *Masque) dialContextL4(ctx context.Context, metadata *C.Metadata) (_ C.Conn, err error) {
@@ -466,6 +549,8 @@ func (w *Masque) DialContext(ctx context.Context, metadata *C.Metadata) (_ C.Con
 		return w.dialContextL4(ctx, metadata)
 	}
 	var conn net.Conn
+	w.sessionUse.enter()
+	defer w.sessionUse.leaveDial()
 	if err = w.run(ctx); err != nil {
 		return nil, err
 	}
@@ -487,7 +572,7 @@ func (w *Masque) DialContext(ctx context.Context, metadata *C.Metadata) (_ C.Con
 	if conn == nil {
 		return nil, errors.New("conn is nil")
 	}
-	return NewConn(conn, w), nil
+	return NewConn(&refCountedConn{Conn: conn, closeHook: w.sessionUse.opened()}, w), nil
 }
 
 func (w *Masque) ListenPacketContext(ctx context.Context, metadata *C.Metadata) (_ C.PacketConn, err error) {
@@ -495,6 +580,8 @@ func (w *Masque) ListenPacketContext(ctx context.Context, metadata *C.Metadata) 
 		return nil, errors.New("masque L4 proxy mode is not supported for UDP")
 	}
 	var pc net.PacketConn
+	w.sessionUse.enter()
+	defer w.sessionUse.leaveDial()
 	if err = w.run(ctx); err != nil {
 		return nil, err
 	}
@@ -509,7 +596,7 @@ func (w *Masque) ListenPacketContext(ctx context.Context, metadata *C.Metadata) 
 	if pc == nil {
 		return nil, errors.New("packetConn is nil")
 	}
-	return NewPacketConn(pc, w), nil
+	return NewPacketConn(&refCountedPacketConn{PacketConn: pc, closeHook: w.sessionUse.opened()}, w), nil
 }
 
 func (w *Masque) ResolveUDP(ctx context.Context, metadata *C.Metadata) error {

@@ -67,6 +67,9 @@ type WireGuard struct {
 	serverAddrMap   map[M.Socksaddr]netip.AddrPort
 	serverAddrTime  atomic.TypedValue[time.Time]
 	serverAddrMutex sync.Mutex
+
+	sessionUse stackSessionUse
+	releasedAt time.Time
 }
 
 type WireGuardOption struct {
@@ -194,6 +197,9 @@ type ipStack interface {
 
 // newIPStack constructs the selected userspace IP stack.
 func newIPStack(option IPStackOption, localAddresses []netip.Prefix, mtu uint32) (ipStack, error) {
+	if ipStackMayRefuse(localAddresses, mtu) {
+		return nil, errIPStackRefused
+	}
 	mode := option.Mode
 	if mode == ipStackAuto {
 		mode = ipStackMips
@@ -492,6 +498,12 @@ func NewWireGuard(option WireGuardOption) (*WireGuard, error) {
 		})
 	}
 
+	registerLazyStack(&lazyStackEntry{
+		name:     option.Name,
+		lastUsed: outbound.sessionUse.lastUsed,
+		release:  outbound.ReleaseSessions,
+	})
+
 	return outbound, nil
 }
 
@@ -518,6 +530,13 @@ func (w *WireGuard) init(ctx context.Context) error {
 }
 
 func (w *WireGuard) init0(ctx context.Context) (err error) {
+	if wait := lazyStackRehandshakeGap - time.Since(w.releasedAt); wait > 0 {
+		select {
+		case <-time.After(wait):
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
 	if w.initOk.Load() {
 		return nil
 	}
@@ -804,6 +823,7 @@ func (w *WireGuard) genIpcConf(ctx context.Context, updateOnly bool) (string, er
 
 // Close implements C.ProxyAdapter
 func (w *WireGuard) Close() error {
+	unregisterLazyStack(w.option.Name)
 	w.runCancel()
 	w.deviceMutex.Lock()
 	wgDevice := w.device
@@ -814,8 +834,39 @@ func (w *WireGuard) Close() error {
 	return nil
 }
 
+// ReleaseSessions 空闲释放: 无在途拨号且无活跃连接时拆除底层 netstack 与 wireguard device,
+// 下次拨号按 init0 重新构建(一次 WireGuard 握手)。返回是否成功释放。
+func (w *WireGuard) ReleaseSessions() bool {
+	w.sessionUse.mu.Lock()
+	if w.sessionUse.dialing > 0 || w.sessionUse.conns > 0 {
+		w.sessionUse.mu.Unlock()
+		return false
+	}
+	w.deviceMutex.Lock()
+	wgDevice := w.device
+	if wgDevice == nil {
+		w.deviceMutex.Unlock()
+		w.sessionUse.mu.Unlock()
+		return true
+	}
+	w.device, w.tunDevice = nil, nil
+	w.deviceMutex.Unlock()
+	w.sessionUse.mu.Unlock()
+
+	w.initMutex.Lock()
+	w.initOk.Store(false)
+	w.initErr = nil
+	w.initMutex.Unlock()
+
+	w.releasedAt = time.Now()
+	wgDevice.Close()
+	return true
+}
+
 func (w *WireGuard) DialContext(ctx context.Context, metadata *C.Metadata) (_ C.Conn, err error) {
 	var conn net.Conn
+	w.sessionUse.enter()
+	defer w.sessionUse.leaveDial()
 	if err = w.init(ctx); err != nil {
 		return nil, err
 	}
@@ -837,11 +888,13 @@ func (w *WireGuard) DialContext(ctx context.Context, metadata *C.Metadata) (_ C.
 	if conn == nil {
 		return nil, E.New("conn is nil")
 	}
-	return NewConn(conn, w), nil
+	return NewConn(&refCountedConn{Conn: conn, closeHook: w.sessionUse.opened()}, w), nil
 }
 
 func (w *WireGuard) ListenPacketContext(ctx context.Context, metadata *C.Metadata) (_ C.PacketConn, err error) {
 	var pc net.PacketConn
+	w.sessionUse.enter()
+	defer w.sessionUse.leaveDial()
 	if err = w.init(ctx); err != nil {
 		return nil, err
 	}
@@ -856,7 +909,7 @@ func (w *WireGuard) ListenPacketContext(ctx context.Context, metadata *C.Metadat
 	if pc == nil {
 		return nil, E.New("packetConn is nil")
 	}
-	return NewPacketConn(pc, w), nil
+	return NewPacketConn(&refCountedPacketConn{PacketConn: pc, closeHook: w.sessionUse.opened()}, w), nil
 }
 
 func (w *WireGuard) ResolveUDP(ctx context.Context, metadata *C.Metadata) error {

@@ -475,6 +475,12 @@ func handleUDPConn(packet C.PacketAdapter) {
 	})
 	if !loaded {
 		dial := func() (C.PacketConn, C.WriteBackProxy, error) {
+			if !admitUDPDial() {
+				log.Debugln("[UDP] refused by admission control (limit %d)", udpDialAdmitLimit)
+				return nil, nil, errors.New("udp dial refused by admission control")
+			}
+			defer releaseUDPDial()
+			globalSessionPacer.wait(context.Background(), C.UDP)
 			originMetadata := metadata  // save origin metadata
 			metadata = metadata.Clone() // don't modify PacketAdapter's metadata
 
@@ -535,6 +541,13 @@ func handleTCPConn(connCtx C.ConnContext) {
 		_ = connCtx.Conn().Close()
 		return
 	}
+	if !admitTCPConn() {
+		log.Debugln("[TCP] refused by admission control (limit %d)", tcpConnAdmitLimit)
+		_ = connCtx.Conn().Close()
+		return
+	}
+	defer releaseTCPConn()
+	globalSessionPacer.wait(context.Background(), C.TCP)
 
 	defer func(conn net.Conn) {
 		_ = conn.Close()

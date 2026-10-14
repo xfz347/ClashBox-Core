@@ -48,6 +48,26 @@ type TrackerInfo struct {
 	RulePayload     string       `json:"rulePayload"`
 	MaxUploadRate   atomic.Int64 `json:"maxUploadRate"`
 	MaxDownloadRate atomic.Int64 `json:"maxDownloadRate"`
+
+	lastDown atomic.TypedValue[time.Time] `json:"-"`
+	lastUp   atomic.TypedValue[time.Time] `json:"-"`
+}
+
+// SinceDownload 距最近一次下行数据的时间
+func (ti *TrackerInfo) SinceDownload() time.Duration { return time.Since(ti.lastDown.Load()) }
+
+// SinceUpload 距最近一次上行数据的时间
+func (ti *TrackerInfo) SinceUpload() time.Duration { return time.Since(ti.lastUp.Load()) }
+
+func (ti *TrackerInfo) touchDown() { ti.lastDown.Store(time.Now()) }
+
+func (ti *TrackerInfo) touchUp() { ti.lastUp.Store(time.Now()) }
+
+// ActivityTracker 带活动时间信息的连接追踪器
+type ActivityTracker interface {
+	Tracker
+	SinceDownload() time.Duration
+	SinceUpload() time.Duration
 }
 
 type tcpTracker struct {
@@ -72,6 +92,7 @@ func (tt *tcpTracker) Info() *TrackerInfo {
 func (tt *tcpTracker) Read(b []byte) (int, error) {
 	n, err := tt.Conn.Read(b)
 	download := int64(n)
+	tt.touchDown()
 	if tt.pushToManager {
 		tt.manager.PushDownloaded(tt.Conn.Chains().Last(), download)
 	}
@@ -83,6 +104,7 @@ func (tt *tcpTracker) Read(b []byte) (int, error) {
 func (tt *tcpTracker) ReadBuffer(buffer *buf.Buffer) (err error) {
 	err = tt.Conn.ReadBuffer(buffer)
 	download := int64(buffer.Len())
+	tt.touchDown()
 	if tt.pushToManager {
 		tt.manager.PushDownloaded(tt.Chains().Last(), download)
 	}
@@ -93,6 +115,7 @@ func (tt *tcpTracker) ReadBuffer(buffer *buf.Buffer) (err error) {
 
 func (tt *tcpTracker) UnwrapReader() (io.Reader, []N.CountFunc) {
 	return tt.Conn, []N.CountFunc{func(download int64) {
+		tt.touchDown()
 		if tt.pushToManager {
 			tt.manager.PushDownloaded(tt.Chains().Last(), download)
 		}
@@ -104,6 +127,7 @@ func (tt *tcpTracker) UnwrapReader() (io.Reader, []N.CountFunc) {
 func (tt *tcpTracker) Write(b []byte) (int, error) {
 	n, err := tt.Conn.Write(b)
 	upload := int64(n)
+	tt.touchUp()
 	if tt.pushToManager {
 		tt.manager.PushUploaded(tt.Chains().Last(), upload)
 	}
@@ -115,6 +139,7 @@ func (tt *tcpTracker) Write(b []byte) (int, error) {
 func (tt *tcpTracker) WriteBuffer(buffer *buf.Buffer) (err error) {
 	upload := int64(buffer.Len())
 	err = tt.Conn.WriteBuffer(buffer)
+	tt.touchUp()
 	if tt.pushToManager {
 		tt.manager.PushUploaded(tt.Chains().Last(), upload)
 	}
@@ -125,6 +150,7 @@ func (tt *tcpTracker) WriteBuffer(buffer *buf.Buffer) (err error) {
 
 func (tt *tcpTracker) UnwrapWriter() (io.Writer, []N.CountFunc) {
 	return tt.Conn, []N.CountFunc{func(upload int64) {
+		tt.touchUp()
 		if tt.pushToManager {
 			tt.manager.PushUploaded(tt.Chains().Last(), upload)
 		}
@@ -167,6 +193,8 @@ func NewTCPTracker(conn C.Conn, manager *Manager, metadata *C.Metadata, rule C.R
 		uploadBucketWindow:   newBucketWindow(10, 100),
 		downloadBucketWindow: newBucketWindow(10, 100),
 	}
+	tt.lastDown.Store(time.Now())
+	tt.lastUp.Store(time.Now())
 
 	if pushToManager {
 		if uploadTotal > 0 {
@@ -208,6 +236,7 @@ func (ut *udpTracker) Info() *TrackerInfo {
 func (ut *udpTracker) ReadFrom(b []byte) (int, net.Addr, error) {
 	n, addr, err := ut.PacketConn.ReadFrom(b)
 	download := int64(n)
+	ut.touchDown()
 	if ut.pushToManager {
 		ut.manager.PushDownloaded(ut.Chains().Last(), download)
 	}
@@ -219,6 +248,7 @@ func (ut *udpTracker) ReadFrom(b []byte) (int, net.Addr, error) {
 func (ut *udpTracker) WaitReadFrom() (data []byte, put func(), addr net.Addr, err error) {
 	data, put, addr, err = ut.PacketConn.WaitReadFrom()
 	download := int64(len(data))
+	ut.touchDown()
 	if ut.pushToManager {
 		ut.manager.PushDownloaded(ut.Chains().Last(), download)
 	}
@@ -230,6 +260,7 @@ func (ut *udpTracker) WaitReadFrom() (data []byte, put func(), addr net.Addr, er
 func (ut *udpTracker) WriteTo(b []byte, addr net.Addr) (int, error) {
 	n, err := ut.PacketConn.WriteTo(b, addr)
 	upload := int64(n)
+	ut.touchUp()
 	if ut.pushToManager {
 		ut.manager.PushUploaded(ut.Chains().Last(), upload)
 	}
@@ -272,6 +303,8 @@ func NewUDPTracker(conn C.PacketConn, manager *Manager, metadata *C.Metadata, ru
 		uploadBucketWindow:   newBucketWindow(10, 100),
 		downloadBucketWindow: newBucketWindow(10, 100),
 	}
+	ut.lastDown.Store(time.Now())
+	ut.lastUp.Store(time.Now())
 
 	if pushToManager {
 		if uploadTotal > 0 {
