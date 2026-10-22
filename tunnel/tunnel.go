@@ -18,6 +18,7 @@ import (
 	"github.com/metacubex/mihomo/common/utils"
 	"github.com/metacubex/mihomo/component/loopback"
 	"github.com/metacubex/mihomo/component/nat"
+	"github.com/metacubex/mihomo/component/mitm"
 	"github.com/metacubex/mihomo/component/process"
 	"github.com/metacubex/mihomo/component/proxydialer"
 	"github.com/metacubex/mihomo/component/resolver"
@@ -67,6 +68,7 @@ var (
 
 	snifferDispatcher *sniffer.Dispatcher
 	sniffingEnable    = false
+	mitmHandler       *mitm.Handler
 
 	ruleUpdateCallback = utils.NewCallback[P.RuleProvider]()
 
@@ -269,6 +271,36 @@ func UpdateSniffer(dispatcher *sniffer.Dispatcher) {
 	snifferDispatcher = dispatcher
 	sniffingEnable = dispatcher.Enable()
 	configMux.Unlock()
+}
+
+// UpdateMITM installs or removes the built-in TLS interception handler.
+func UpdateMITM(handler *mitm.Handler) {
+	configMux.Lock()
+	mitmHandler = handler
+	configMux.Unlock()
+}
+
+// CurrentMITM returns the active interception handler, if any.
+func CurrentMITM() *mitm.Handler {
+	configMux.RLock()
+	defer configMux.RUnlock()
+	return mitmHandler
+}
+
+// DialMITM dials an intercepted request through the normal rule/outbound
+// pipeline. It must never feed the connection back into the TUN inbound.
+func DialMITM(metadata *C.Metadata) (net.Conn, error) {
+	proxy, rule, err := resolveMetadata(metadata)
+	if err != nil {
+		return nil, err
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), C.DefaultTCPTimeout)
+	defer cancel()
+	remoteConn, err := proxy.DialContext(ctx, metadata)
+	if err != nil {
+		return nil, err
+	}
+	return statistic.NewTCPTracker(remoteConn, statistic.DefaultManager, metadata, rule, 0, 0, true), nil
 }
 
 // Mode return current mode
@@ -583,6 +615,14 @@ func handleTCPConn(connCtx C.ConnContext) {
 	if preHandleFailed {
 		log.Debugln("[Metadata PreHandle] failed to sniff a domain for connection %s --> %s, give up",
 			metadata.SourceDetail(), metadata.RemoteAddress())
+		return
+	}
+
+	configMux.RLock()
+	interceptor := mitmHandler
+	configMux.RUnlock()
+	if interceptor != nil && interceptor.Enabled() && (metadata.DstPort == 443 || metadata.DstPort == 80) && interceptor.Match(metadata.Host) {
+		interceptor.Handle(conn, metadata)
 		return
 	}
 
