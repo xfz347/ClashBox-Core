@@ -60,7 +60,15 @@ func LoadOrCreateCA(dir string) (*CA, error) {
 		}
 		key, err := x509.ParseECPrivateKey(keyBlock.Bytes)
 		if err != nil {
-			return nil, err
+			parsed, parseErr := x509.ParsePKCS8PrivateKey(keyBlock.Bytes)
+			if parseErr != nil {
+				return nil, err
+			}
+			ecKey, ok := parsed.(*ecdsa.PrivateKey)
+			if !ok {
+				return nil, fmt.Errorf("CA key is not ECDSA")
+			}
+			key = ecKey
 		}
 		leafKey, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
 		if err != nil {
