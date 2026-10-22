@@ -23,6 +23,7 @@ import (
 	"github.com/metacubex/mihomo/component/cidr"
 	"github.com/metacubex/mihomo/component/fakeip"
 	"github.com/metacubex/mihomo/component/geodata"
+	"github.com/metacubex/mihomo/component/mitm"
 	"github.com/metacubex/mihomo/component/process"
 	"github.com/metacubex/mihomo/component/resolver"
 	"github.com/metacubex/mihomo/component/sniffer"
@@ -196,6 +197,7 @@ type Config struct {
 	General       *General
 	Controller    *Controller
 	Experimental  *Experimental
+	Mitm          *mitm.Config
 	IPTables      *IPTables
 	NTP           *NTP
 	DNS           *DNS
@@ -352,6 +354,53 @@ type RawIPTables struct {
 	DnsRedirect      bool     `yaml:"dns-redirect" json:"dns-redirect"`
 }
 
+// RawMITM is the built-in TLS interception configuration.
+type RawMITMRewrite struct {
+	Phase   string `yaml:"phase" json:"phase"`
+	Pattern string `yaml:"pattern" json:"pattern"`
+	Target  string `yaml:"target" json:"target"`
+	Flag    string `yaml:"flag" json:"flag"`
+}
+
+type RawMITMScript struct {
+	Phase    string `yaml:"phase" json:"phase"`
+	Pattern  string `yaml:"pattern" json:"pattern"`
+	Content  string `yaml:"content" json:"content"`
+	Argument string `yaml:"argument" json:"argument"`
+	Engine   string `yaml:"engine" json:"engine"`
+}
+
+type RawModuleProvider struct {
+	Name   string `yaml:"name" json:"name"`
+	Path   string `yaml:"path" json:"path"`
+	Target string `yaml:"target" json:"target"`
+}
+
+type RawMITMJq struct {
+	Phase   string `yaml:"phase" json:"phase"`
+	Pattern string `yaml:"pattern" json:"pattern"`
+	Expr    string `yaml:"expr" json:"expr"`
+}
+
+type RawMITMLocalResponse struct {
+	Pattern string   `yaml:"pattern" json:"pattern"`
+	Data    string   `yaml:"data" json:"data"`
+	Status  int      `yaml:"status" json:"status"`
+	Headers []string `yaml:"headers" json:"headers"`
+}
+
+type RawMITM struct {
+	Enable         bool                   `yaml:"enable" json:"enable"`
+	Domains        []string               `yaml:"domains" json:"domains"`
+	ExcludeDomains []string               `yaml:"exclude-domains" json:"exclude-domains"`
+	CaptureBody    bool                   `yaml:"capture-body" json:"capture-body"`
+	MaxBodySize    int                    `yaml:"max-body-size" json:"max-body-size"`
+	Rewrites       []RawMITMRewrite       `yaml:"rewrites" json:"rewrites"`
+	Scripts        []RawMITMScript        `yaml:"scripts" json:"scripts"`
+	Locals         []RawMITMLocalResponse `yaml:"locals" json:"locals"`
+	BodyJq         []RawMITMJq            `yaml:"body-jq" json:"bodyJq"`
+}
+
 type RawExperimental struct {
 	Fingerprints     []string `yaml:"fingerprints" json:"fingerprints"`
 	QUICGoDisableGSO bool     `yaml:"quic-go-disable-gso" json:"quic-go-disable-gso"`
@@ -450,6 +499,7 @@ type RawConfig struct {
 
 	ProxyProvider map[string]map[string]any `yaml:"proxy-providers" json:"proxy-providers"`
 	RuleProvider  map[string]map[string]any `yaml:"rule-providers" json:"rule-providers"`
+	ModuleRuleProviders []RawModuleProvider `yaml:"module-rule-providers" json:"module-rule-providers"`
 	Proxy         []map[string]any          `yaml:"proxies" json:"proxies"`
 	ProxyGroup    []map[string]any          `yaml:"proxy-groups" json:"proxy-groups"`
 	Rule          []string                  `yaml:"rules" json:"rule"`
@@ -462,6 +512,7 @@ type RawConfig struct {
 	TuicServer    RawTuicServer             `yaml:"tuic-server" json:"tuic-server"`
 	IPTables      RawIPTables               `yaml:"iptables" json:"iptables"`
 	Experimental  RawExperimental           `yaml:"experimental" json:"experimental"`
+	Mitm          *RawMITM                  `yaml:"mitm" json:"mitm,omitempty"`
 	Profile       RawProfile                `yaml:"profile" json:"profile"`
 	GeoXUrl       RawGeoXUrl                `yaml:"geox-url" json:"geox-url"`
 	Sniffer       RawSniffer                `yaml:"sniffer" json:"sniffer"`
@@ -649,6 +700,7 @@ func ParseRawConfig(rawCfg *RawConfig) (*Config, error) {
 		return nil, err
 	}
 	config.Experimental = experimental
+	config.Mitm = parseMITM(rawCfg.Mitm)
 
 	iptables, err := parseIPTables(rawCfg)
 	if err != nil {
@@ -828,6 +880,56 @@ func parseController(cfg *RawConfig) (*Controller, error) {
 			AllowPrivateNetwork: cfg.ExternalControllerCors.AllowPrivateNetwork,
 		},
 	}, nil
+}
+
+func parseMITM(raw *RawMITM) *mitm.Config {
+	if raw == nil {
+		return nil
+	}
+	maxBodySize := raw.MaxBodySize
+	if maxBodySize <= 0 {
+		maxBodySize = 1 << 20
+	}
+	cfg := &mitm.Config{
+		Enable:         raw.Enable,
+		Domains:        raw.Domains,
+		ExcludeDomains: raw.ExcludeDomains,
+		CaptureBody:    raw.CaptureBody,
+		MaxBodySize:    maxBodySize,
+	}
+	for _, rewrite := range raw.Rewrites {
+		cfg.Rewrites = append(cfg.Rewrites, mitm.Rewrite{
+			Phase:   rewrite.Phase,
+			Pattern: rewrite.Pattern,
+			Target:  rewrite.Target,
+			Flag:    rewrite.Flag,
+		})
+	}
+	for _, script := range raw.Scripts {
+		cfg.Scripts = append(cfg.Scripts, mitm.Script{
+			Phase:   script.Phase,
+			Pattern: script.Pattern,
+			Content: script.Content,
+			Argument: script.Argument,
+			Engine:   script.Engine,
+		})
+	}
+	for _, local := range raw.Locals {
+		cfg.LocalResponses = append(cfg.LocalResponses, mitm.LocalResponse{
+			Pattern: local.Pattern,
+			Data:    local.Data,
+			Status:  local.Status,
+			Headers: local.Headers,
+		})
+	}
+	for _, jq := range raw.BodyJq {
+		cfg.JqRules = append(cfg.JqRules, mitm.JqRule{
+			Phase:   jq.Phase,
+			Pattern: jq.Pattern,
+			Expr:    jq.Expr,
+		})
+	}
+	return cfg
 }
 
 func parseExperimental(cfg *RawConfig) (*Experimental, error) {

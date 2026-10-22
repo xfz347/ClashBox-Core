@@ -1,10 +1,12 @@
 package executor
 
 import (
+	"encoding/json"
 	"fmt"
 	"net"
 	"net/netip"
 	"os"
+	"path/filepath"
 	"runtime"
 	"strconv"
 	"sync"
@@ -21,6 +23,7 @@ import (
 	mihomoHttp "github.com/metacubex/mihomo/component/http"
 	"github.com/metacubex/mihomo/component/iface"
 	"github.com/metacubex/mihomo/component/keepalive"
+	"github.com/metacubex/mihomo/component/mitm"
 	"github.com/metacubex/mihomo/component/profile"
 	"github.com/metacubex/mihomo/component/profile/cachefile"
 	"github.com/metacubex/mihomo/component/resolver"
@@ -100,6 +103,7 @@ func ApplyConfig(cfg *config.Config, force bool) {
 	updateProxies(cfg.Proxies, cfg.Providers)
 	updateRules(cfg.Rules, cfg.SubRules, cfg.RuleProviders)
 	updateSniffer(cfg.Sniffer)
+	updateMITM(cfg.Mitm)
 	updateHosts(cfg.Hosts)
 	updateGeneral(cfg.General, true)
 	updateDNS(cfg.DNS, cfg.General.IPv6)
@@ -356,6 +360,65 @@ func loadProvider[T P.Provider](providers map[string]T) {
 			load(pv)
 		}()
 	}
+}
+
+// UpdateMITM applies MITM configuration on the patch fast-path as well.
+func UpdateMITM(cfg *mitm.Config) {
+	updateMITM(cfg)
+}
+
+var mitmRulesCache struct {
+	modTime time.Time
+	size    int64
+	rules   mitm.RulesFile
+}
+
+func loadMitmRulesFile() *mitm.RulesFile {
+	path := filepath.Join(C.Path.HomeDir(), "mitm-rules.json")
+	info, err := os.Stat(path)
+	if err != nil {
+		return nil
+	}
+	if info.ModTime().Equal(mitmRulesCache.modTime) && info.Size() == mitmRulesCache.size {
+		return &mitmRulesCache.rules
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil
+	}
+	var rules mitm.RulesFile
+	if err := json.Unmarshal(data, &rules); err != nil {
+		return nil
+	}
+	mitmRulesCache.modTime = info.ModTime()
+	mitmRulesCache.size = info.Size()
+	mitmRulesCache.rules = rules
+	return &rules
+}
+
+func updateMITM(cfg *mitm.Config) {
+	if cfg == nil || !cfg.Enable {
+		tunnel.UpdateMITM(nil)
+		return
+	}
+	if rules := loadMitmRulesFile(); rules != nil {
+		cfg.Rewrites = rules.Rewrites
+		cfg.Scripts = rules.Scripts
+		cfg.JqRules = rules.JqRules
+		cfg.LocalResponses = rules.LocalResponses
+	}
+	if !tunnel.IsSniffing() {
+		log.Warnln("MITM requires the sniffer to be enabled; intercepted domains will not be detected")
+	}
+	dir := filepath.Join(C.Path.HomeDir(), "mitm")
+	ca, err := mitm.LoadOrCreateCA(dir)
+	if err != nil {
+		log.Warnln("initial MITM CA failed: %v", err)
+		tunnel.UpdateMITM(nil)
+		return
+	}
+	tunnel.UpdateMITM(mitm.New(cfg, ca, tunnel.DialMITM))
+	log.Infoln("MITM is enabled for %d domain(s)", len(cfg.Domains))
 }
 
 func updateSniffer(snifferConfig *sniffer.Config) {
