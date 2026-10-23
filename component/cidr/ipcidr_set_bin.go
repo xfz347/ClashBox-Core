@@ -9,6 +9,9 @@ import (
 	"go4.org/netipx"
 )
 
+// maxBinLength 防御损坏的 .mrs 文件: length 过大时 make() 会触发 makeslice panic(SIGABRT)。
+const maxBinLength = 1 << 26
+
 func (ss *IpCidrSet) WriteBin(w io.Writer) (err error) {
 	// version
 	_, err = w.Write([]byte{1})
@@ -54,7 +57,7 @@ func ReadIpCidrSet(r io.Reader) (ss *IpCidrSet, err error) {
 	if err != nil {
 		return nil, err
 	}
-	if length < 1 {
+	if length < 1 || length > maxBinLength {
 		return nil, errors.New("length is invalid")
 	}
 	ss.rr = make([]netipx.IPRange, length)

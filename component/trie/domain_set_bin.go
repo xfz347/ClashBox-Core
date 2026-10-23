@@ -6,6 +6,10 @@ import (
 	"io"
 )
 
+// maxBinLength 防御损坏的 .mrs 文件: length 过大时 make() 会触发 makeslice panic(SIGABRT)。
+// 正常 geosite 规则集条目远小于此值(百万级), 1<<26 已足够大且不会误伤。
+const maxBinLength = 1 << 26
+
 func (ss *DomainSet) WriteBin(w io.Writer) (err error) {
 	// version
 	_, err = w.Write([]byte{1})
@@ -69,7 +73,7 @@ func ReadDomainSetBin(r io.Reader) (ds *DomainSet, err error) {
 	if err != nil {
 		return nil, err
 	}
-	if length < 1 {
+	if length < 1 || length > maxBinLength {
 		return nil, errors.New("length is invalid")
 	}
 	ds.leaves = make([]uint64, length)
@@ -85,7 +89,7 @@ func ReadDomainSetBin(r io.Reader) (ds *DomainSet, err error) {
 	if err != nil {
 		return nil, err
 	}
-	if length < 1 {
+	if length < 1 || length > maxBinLength {
 		return nil, errors.New("length is invalid")
 	}
 	ds.labelBitmap = make([]uint64, length)
@@ -101,7 +105,7 @@ func ReadDomainSetBin(r io.Reader) (ds *DomainSet, err error) {
 	if err != nil {
 		return nil, err
 	}
-	if length < 1 {
+	if length < 1 || length > maxBinLength {
 		return nil, errors.New("length is invalid")
 	}
 	ds.labels = make([]byte, length)
