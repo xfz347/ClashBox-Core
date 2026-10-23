@@ -7,11 +7,14 @@ import (
 
 // Rewrite is a declarative module rewrite rule.
 type Rewrite struct {
-	// Phase: url / header / body
+	// Phase: url / header / body / request-header / response-header / request-body / response-body
 	Phase   string `json:"phase"`
 	Pattern string `json:"pattern"`
 	Target  string `json:"target"`
 	Flag    string `json:"flag"`
+	Search  string `json:"search"`
+	Name    string `json:"name"`
+	Value   string `json:"value"`
 }
 
 // Script is a module script (Surge script phase, pattern and source).
@@ -32,6 +35,13 @@ type JqRule struct {
 	Expr    string `json:"expr"`
 }
 
+// HTTPRule is a module URL-REGEX/USER-AGENT rule evaluated at the MITM HTTP layer.
+type HTTPRule struct {
+	Type    string `json:"type"`
+	Pattern string `json:"pattern"`
+	Policy  string `json:"policy"`
+}
+
 // LocalResponse is a Surge [Map Local] rule: return a fixed local response.
 type LocalResponse struct {
 	Pattern string   `json:"pattern"`
@@ -46,6 +56,7 @@ type RulesFile struct {
 	Scripts        []Script        `json:"scripts"`
 	JqRules        []JqRule        `json:"bodyJq"`
 	LocalResponses []LocalResponse `json:"locals"`
+	HTTPRules      []HTTPRule      `json:"httpRules"`
 }
 
 // Config is the runtime configuration of the built-in TLS interception layer.
@@ -59,6 +70,7 @@ type Config struct {
 	Scripts        []Script
 	JqRules        []JqRule
 	LocalResponses []LocalResponse
+	HTTPRules      []HTTPRule
 }
 
 func normalizeDomain(domain string) string {

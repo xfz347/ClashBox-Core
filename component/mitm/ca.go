@@ -39,7 +39,7 @@ type CA struct {
 // LoadOrCreateCA loads the CA from dir, generating it on first use.
 func LoadOrCreateCA(dir string) (*CA, error) {
 	if err := os.MkdirAll(dir, 0o700); err != nil {
-		return nil, err
+		return nil, fmt.Errorf("create CA dir %q: %w", dir, err)
 	}
 	certPath := filepath.Join(dir, caCertFile)
 	keyPath := filepath.Join(dir, caKeyFile)
@@ -47,32 +47,32 @@ func LoadOrCreateCA(dir string) (*CA, error) {
 	if certPEM, err := os.ReadFile(certPath); err == nil {
 		keyPEM, err := os.ReadFile(keyPath)
 		if err != nil {
-			return nil, fmt.Errorf("read CA key: %w", err)
+			return nil, fmt.Errorf("read CA key %q: %w", keyPath, err)
 		}
 		certBlock, _ := pem.Decode(certPEM)
 		keyBlock, _ := pem.Decode(keyPEM)
 		if certBlock == nil || keyBlock == nil {
-			return nil, fmt.Errorf("invalid CA pem")
+			return nil, fmt.Errorf("invalid CA pem (cert block %v, key block %v)", certBlock != nil, keyBlock != nil)
 		}
 		cert, err := x509.ParseCertificate(certBlock.Bytes)
 		if err != nil {
-			return nil, err
+			return nil, fmt.Errorf("parse CA cert %q: %w", certPath, err)
 		}
 		key, err := x509.ParseECPrivateKey(keyBlock.Bytes)
 		if err != nil {
 			parsed, parseErr := x509.ParsePKCS8PrivateKey(keyBlock.Bytes)
 			if parseErr != nil {
-				return nil, err
+				return nil, fmt.Errorf("parse CA key %q (SEC1: %v; PKCS8: %v)", keyPath, err, parseErr)
 			}
 			ecKey, ok := parsed.(*ecdsa.PrivateKey)
 			if !ok {
-				return nil, fmt.Errorf("CA key is not ECDSA")
+				return nil, fmt.Errorf("CA key is not ECDSA (got %T)", parsed)
 			}
 			key = ecKey
 		}
 		leafKey, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
 		if err != nil {
-			return nil, err
+			return nil, fmt.Errorf("generate CA leaf key: %w", err)
 		}
 		return &CA{
 			cert:    cert,
@@ -82,16 +82,29 @@ func LoadOrCreateCA(dir string) (*CA, error) {
 			cache:   make(map[string]*tls.Certificate),
 		}, nil
 	} else if !os.IsNotExist(err) {
-		return nil, err
+		return nil, fmt.Errorf("read CA cert %q: %w", certPath, err)
 	}
 
+	var lastErr error
+	for attempt := 0; attempt < 3; attempt++ {
+		ca, err := createAndWriteCA(certPath, keyPath)
+		if err == nil {
+			return ca, nil
+		}
+		lastErr = err
+		time.Sleep(time.Duration(attempt+1) * 100 * time.Millisecond)
+	}
+	return nil, fmt.Errorf("generate CA failed after 3 attempts: %w", lastErr)
+}
+
+func createAndWriteCA(certPath, keyPath string) (*CA, error) {
 	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("generate CA private key (ECDSA P-256): %w", err)
 	}
 	serial, err := randomSerial()
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("generate CA serial (rand.Reader): %w", err)
 	}
 	now := time.Now()
 	template := &x509.Certificate{
@@ -109,27 +122,27 @@ func LoadOrCreateCA(dir string) (*CA, error) {
 	}
 	der, err := x509.CreateCertificate(rand.Reader, template, template, &key.PublicKey, key)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("create self-signed CA certificate: %w", err)
 	}
 	cert, err := x509.ParseCertificate(der)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("parse generated CA certificate: %w", err)
 	}
 	certPEM := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der})
 	keyDER, err := x509.MarshalECPrivateKey(key)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("marshal CA private key: %w", err)
 	}
 	keyPEM := pem.EncodeToMemory(&pem.Block{Type: "EC PRIVATE KEY", Bytes: keyDER})
 	if err := os.WriteFile(certPath, certPEM, 0o644); err != nil {
-		return nil, err
+		return nil, fmt.Errorf("write CA cert %q: %w", certPath, err)
 	}
 	if err := os.WriteFile(keyPath, keyPEM, 0o600); err != nil {
-		return nil, err
+		return nil, fmt.Errorf("write CA key %q: %w", keyPath, err)
 	}
 	leafKey, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("generate CA leaf key: %w", err)
 	}
 	return &CA{
 		cert:    cert,

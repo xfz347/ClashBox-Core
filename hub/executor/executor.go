@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 	_ "unsafe"
@@ -411,6 +412,17 @@ func updateMITM(cfg *mitm.Config) {
 		cfg.Scripts = rules.Scripts
 		cfg.JqRules = rules.JqRules
 		cfg.LocalResponses = rules.LocalResponses
+		cfg.HTTPRules = rules.HTTPRules
+		proxies := tunnel.Proxies()
+		for i := range cfg.HTTPRules {
+			policy := strings.TrimSpace(cfg.HTTPRules[i].Policy)
+			upper := strings.ToUpper(policy)
+			if upper != "" && upper != "DIRECT" && !strings.HasPrefix(upper, "REJECT") {
+				if _, ok := proxies[policy]; !ok {
+					cfg.HTTPRules[i].Policy = ""
+				}
+			}
+		}
 	}
 	if !tunnel.IsSniffing() {
 		log.Warnln("MITM requires the sniffer to be enabled; intercepted domains will not be detected")

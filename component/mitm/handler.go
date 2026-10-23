@@ -33,6 +33,9 @@ type compiledRewrite struct {
 	pattern string
 	target  string
 	flag    string
+	search  string
+	name    string
+	value   string
 }
 
 var mitmRegexCache sync.Map
@@ -105,6 +108,22 @@ type compiledJq struct {
 	expr    string
 }
 
+type compiledHTTPRule struct {
+	typ     string
+	pattern string
+	policy  string
+	re      *regexp.Regexp
+}
+
+type enginePolicyKey struct{}
+
+func userAgentPattern(pattern string) string {
+	quoted := regexp.QuoteMeta(pattern)
+	quoted = strings.ReplaceAll(quoted, `\*`, `.*`)
+	quoted = strings.ReplaceAll(quoted, `\?`, `.`)
+	return `(?i)^` + quoted + `$`
+}
+
 // Handler intercepts TLS connections and relays decrypted HTTP traffic.
 type Handler struct {
 	cfg       *Config
@@ -117,6 +136,7 @@ type Handler struct {
 	scripts   []compiledScript
 	locals    []compiledLocalResponse
 	jqRules   []compiledJq
+	httpRules []compiledHTTPRule
 }
 
 // New creates a MITM handler. dial must not route the connection back into
@@ -135,6 +155,9 @@ func New(cfg *Config, ca *CA, dial DialFunc) *Handler {
 			pattern: rewrite.Pattern,
 			target:  rewrite.Target,
 			flag:    rewrite.Flag,
+			search:  rewrite.Search,
+			name:    rewrite.Name,
+			value:   rewrite.Value,
 		})
 	}
 	for _, script := range cfg.Scripts {
@@ -166,6 +189,29 @@ func New(cfg *Config, ca *CA, dial DialFunc) *Handler {
 			phase:   strings.ToLower(rule.Phase),
 			pattern: rule.Pattern,
 			expr:    rule.Expr,
+		})
+	}
+	for _, rule := range cfg.HTTPRules {
+		typ := strings.ToLower(strings.TrimSpace(rule.Type))
+		var re *regexp.Regexp
+		var err error
+		switch typ {
+		case "url-regex":
+			re, err = regexp.Compile(rule.Pattern)
+		case "user-agent":
+			re, err = regexp.Compile(userAgentPattern(rule.Pattern))
+		default:
+			continue
+		}
+		if err != nil {
+			log.Warnln("[MITM] invalid HTTP rule %q: %v", rule.Pattern, err)
+			continue
+		}
+		h.httpRules = append(h.httpRules, compiledHTTPRule{
+			typ:     typ,
+			pattern: rule.Pattern,
+			policy:  strings.TrimSpace(rule.Policy),
+			re:      re,
 		})
 	}
 	return h
@@ -263,6 +309,9 @@ func (h *Handler) newTransport(base *C.Metadata) *http.Transport {
 			meta.NetWork = C.TCP
 			meta.SpecialProxy = ""
 			meta.SpecialRules = ""
+			if policy, _ := ctx.Value(enginePolicyKey{}).(string); policy != "" {
+				meta.SpecialProxy = policy
+			}
 			return h.dial(meta)
 		},
 		TLSClientConfig: &tls.Config{
@@ -274,6 +323,28 @@ func (h *Handler) newTransport(base *C.Metadata) *http.Transport {
 		IdleConnTimeout:       90 * time.Second,
 		MaxIdleConnsPerHost:   4,
 	}
+}
+
+func (h *Handler) matchHTTPRule(req *http.Request) *compiledHTTPRule {
+	if h == nil || req == nil || req.URL == nil {
+		return nil
+	}
+	rawURL := req.URL.String()
+	agent := req.Header.Get("User-Agent")
+	for i := range h.httpRules {
+		rule := &h.httpRules[i]
+		switch rule.typ {
+		case "url-regex":
+			if rule.re != nil && rule.re.MatchString(rawURL) {
+				return rule
+			}
+		case "user-agent":
+			if rule.re != nil && rule.re.MatchString(agent) {
+				return rule
+			}
+		}
+	}
+	return nil
 }
 
 func (h *Handler) serveHTTP(w http.ResponseWriter, r *http.Request, base *C.Metadata, transport *http.Transport, tlsConn *tls.Conn) {
@@ -321,6 +392,22 @@ func (h *Handler) serveHTTP(w http.ResponseWriter, r *http.Request, base *C.Meta
 	}
 	if outReq.Host == "" {
 		outReq.Host = outReq.URL.Host
+	}
+	if rule := h.matchHTTPRule(outReq); rule != nil {
+		policy := strings.TrimSpace(rule.policy)
+		upper := strings.ToUpper(policy)
+		if strings.HasPrefix(upper, "REJECT") {
+			record.Status = http.StatusForbidden
+			record.Error = "blocked by module rule"
+			record.DurationMs = time.Since(start).Milliseconds()
+			addRecord(record)
+			http.Error(w, "blocked by module rule", http.StatusForbidden)
+			return
+		}
+		if policy != "" {
+			outReq = outReq.WithContext(context.WithValue(outReq.Context(), enginePolicyKey{}, policy))
+			outReq.Close = true
+		}
 	}
 	removeHopByHop(outReq.Header)
 	local := h.applyRequestScripts(outReq)
@@ -511,7 +598,17 @@ func (h *Handler) applyRequestRewrites(req *http.Request) *localResponse {
 				}
 			}
 		case "header":
-			applyHeaderAction(req.Header, rewrite.target)
+			if rewrite.pattern == "" || rewriteMatches(rewrite.pattern, req.URL.String()) {
+				applyHeaderAction(req.Header, rewrite.target)
+			}
+		case "request-header":
+			if rewriteMatches(rewrite.pattern, req.URL.String()) {
+				applyHeaderRule(req.Header, rewrite)
+			}
+		case "request-body":
+			if rewriteMatches(rewrite.pattern, req.URL.String()) {
+				applyRequestBody(req, rewrite)
+			}
 		case "body":
 			hasBody = true
 		case "reject":
@@ -530,6 +627,7 @@ func (h *Handler) applyRequestRewrites(req *http.Request) *localResponse {
 			}
 		}
 	}
+	h.applyRequestJq(req)
 	if hasBody {
 		// 保证响应体可被正则处理(避免 gzip 压缩体)
 		req.Header.Set("Accept-Encoding", "identity")
@@ -537,13 +635,46 @@ func (h *Handler) applyRequestRewrites(req *http.Request) *localResponse {
 	return nil
 }
 
+func (h *Handler) applyRequestJq(req *http.Request) {
+	if h == nil || req == nil || req.URL == nil || len(h.jqRules) == 0 {
+		return
+	}
+	requestURL := req.URL.String()
+	matched := false
+	for _, rule := range h.jqRules {
+		if rule.phase == "http-request-jq" && rewriteMatches(rule.pattern, requestURL) {
+			matched = true
+			break
+		}
+	}
+	if !matched || req.Body == nil {
+		return
+	}
+	data, err := io.ReadAll(req.Body)
+	_ = req.Body.Close()
+	if err != nil {
+		return
+	}
+	data = h.applyJqRewrites(data, requestURL, "http-request-jq")
+	req.Body = io.NopCloser(bytes.NewReader(data))
+	req.ContentLength = int64(len(data))
+}
+
 func (h *Handler) applyResponseRewrites(resp *http.Response) {
 	hasBody := false
 	for _, rewrite := range h.rewrites {
 		switch rewrite.phase {
 		case "header":
-			applyHeaderAction(resp.Header, rewrite.target)
+			if rewrite.pattern == "" || rewriteMatches(rewrite.pattern, requestURLOf(resp)) {
+				applyHeaderAction(resp.Header, rewrite.target)
+			}
+		case "response-header":
+			if rewriteMatches(rewrite.pattern, requestURLOf(resp)) {
+				applyHeaderRule(resp.Header, rewrite)
+			}
 		case "body":
+			hasBody = true
+		case "response-body":
 			hasBody = true
 		}
 	}
@@ -578,9 +709,17 @@ func (h *Handler) applyResponseRewrites(resp *http.Response) {
 		return
 	}
 	if hasJq {
-		data = h.applyJqRewrites(data, requestURL)
+		data = h.applyJqRewrites(data, requestURL, "http-response-jq")
 	}
 	for _, rewrite := range h.rewrites {
+		if rewrite.phase == "response-body" {
+			if requestURL != "" && rewriteMatches(rewrite.pattern, requestURL) && rewrite.search != "" {
+				if re := cachedRegex(rewrite.search); re != nil {
+					data = re.ReplaceAll(data, []byte(rewrite.target))
+				}
+			}
+			continue
+		}
 		if rewrite.phase != "body" {
 			continue
 		}
@@ -599,14 +738,14 @@ func (h *Handler) applyResponseRewrites(resp *http.Response) {
 	resp.Header.Del("Content-Encoding")
 }
 
-func (h *Handler) applyJqRewrites(data []byte, requestURL string) []byte {
+func (h *Handler) applyJqRewrites(data []byte, requestURL string, phase string) []byte {
 	var input interface{}
 	if err := json.Unmarshal(data, &input); err != nil {
 		return data
 	}
 	current := input
 	for _, rule := range h.jqRules {
-		if rule.phase != "http-response-jq" {
+		if rule.phase != phase {
 			continue
 		}
 		re := cachedRegex(rule.pattern)
@@ -661,6 +800,54 @@ func applyHeaderAction(header http.Header, target string) {
 			header.Set(name, value)
 		}
 	}
+}
+
+func rewriteMatches(pattern string, value string) bool {
+	if strings.TrimSpace(pattern) == "" {
+		return true
+	}
+	re := cachedRegex(pattern)
+	return re != nil && re.MatchString(value)
+}
+
+func requestURLOf(resp *http.Response) string {
+	if resp != nil && resp.Request != nil && resp.Request.URL != nil {
+		return resp.Request.URL.String()
+	}
+	return ""
+}
+
+func applyHeaderRule(header http.Header, rule compiledRewrite) {
+	name := strings.TrimSpace(rule.name)
+	if name == "" {
+		return
+	}
+	switch strings.ToLower(strings.TrimSpace(rule.target)) {
+	case "add", "header-add":
+		header.Add(name, rule.value)
+	case "del", "delete", "remove", "header-del":
+		header.Del(name)
+	default:
+		header.Set(name, rule.value)
+	}
+}
+
+func applyRequestBody(req *http.Request, rule compiledRewrite) {
+	if req == nil || req.Body == nil || strings.TrimSpace(rule.search) == "" {
+		return
+	}
+	data, err := io.ReadAll(req.Body)
+	_ = req.Body.Close()
+	if err != nil {
+		return
+	}
+	re := cachedRegex(rule.search)
+	if re == nil {
+		return
+	}
+	data = re.ReplaceAll(data, []byte(rule.target))
+	req.Body = io.NopCloser(bytes.NewReader(data))
+	req.ContentLength = int64(len(data))
 }
 
 func splitHeader(text string) (string, string) {

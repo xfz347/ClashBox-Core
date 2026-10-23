@@ -41,7 +41,17 @@ func regenerateMitmCA(w http.ResponseWriter, r *http.Request) {
 	dir := filepath.Join(constant.Path.HomeDir(), "mitm")
 	_ = os.Remove(filepath.Join(dir, "mitm-ca.crt"))
 	_ = os.Remove(filepath.Join(dir, "mitm-ca.key"))
-	render.NoContent(w, r)
+	ca, err := mitm.LoadOrCreateCA(dir)
+	if err != nil {
+		render.Status(r, http.StatusInternalServerError)
+		render.JSON(w, r, map[string]string{"error": err.Error()})
+		return
+	}
+	render.JSON(w, r, mitmCAInfo{
+		Enabled:     true,
+		PEM:         string(ca.PEM()),
+		Fingerprint: ca.Fingerprint(),
+	})
 }
 
 func getMitmCA(w http.ResponseWriter, r *http.Request) {
