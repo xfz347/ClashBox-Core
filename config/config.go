@@ -511,6 +511,7 @@ type RawConfig struct {
 	ProxyProvider map[string]map[string]any `yaml:"proxy-providers" json:"proxy-providers"`
 	RuleProvider  map[string]map[string]any `yaml:"rule-providers" json:"rule-providers"`
 	ModuleRuleProviders []RawModuleProvider `yaml:"module-rule-providers" json:"module-rule-providers"`
+	ModuleInlineRules   []string            `yaml:"module-inline-rules" json:"module-inline-rules"`
 	Proxy         []map[string]any          `yaml:"proxies" json:"proxies"`
 	ProxyGroup    []map[string]any          `yaml:"proxy-groups" json:"proxy-groups"`
 	Rule          []string                  `yaml:"rules" json:"rule"`
