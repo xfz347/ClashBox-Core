@@ -107,6 +107,7 @@ func ApplyConfig(cfg *config.Config, force bool) {
 	updateRules(cfg.Rules, cfg.SubRules, cfg.RuleProviders)
 	updateSniffer(cfg.Sniffer)
 	updateMITM(cfg.Mitm)
+	updateCron()
 	updateHosts(cfg.Hosts)
 	updateGeneral(cfg.General, true)
 	updateDNS(cfg.DNS, cfg.General.IPv6)
@@ -373,6 +374,12 @@ func UpdateMITM(cfg *mitm.Config) {
 	updateMITM(cfg)
 }
 
+// UpdateCron reloads scheduled scripts from mitm-rules.json and applies them
+// to the in-process cron scheduler. It is safe to call on the patch fast-path.
+func UpdateCron() {
+	updateCron()
+}
+
 var mitmRulesCache struct {
 	modTime time.Time
 	size    int64
@@ -436,6 +443,23 @@ func updateMITM(cfg *mitm.Config) {
 	}
 	tunnel.UpdateMITM(mitm.New(cfg, ca, tunnel.DialMITM))
 	log.Infoln("MITM is enabled for %d domain(s)", len(cfg.Domains))
+}
+
+func updateCron() {
+	mitm.UpdateCronScripts(loadCronScriptsFile())
+}
+
+func loadCronScriptsFile() []mitm.CronScript {
+	path := filepath.Join(C.Path.HomeDir(), "cron-scripts.json")
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil
+	}
+	var scripts []mitm.CronScript
+	if err := json.Unmarshal(data, &scripts); err != nil {
+		return nil
+	}
+	return scripts
 }
 
 func updateSniffer(snifferConfig *sniffer.Config) {

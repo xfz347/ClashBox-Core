@@ -17,6 +17,8 @@ type Record struct {
 	ReqBytes   int64  `json:"reqBytes"`
 	RespBytes  int64  `json:"respBytes"`
 	Location   string            `json:"location"`
+	ReqHeaders map[string]string `json:"reqHeaders,omitempty"`
+	ReqBody    string            `json:"reqBody,omitempty"`
 	RespHeaders map[string]string `json:"respHeaders,omitempty"`
 	RespPreview string            `json:"respPreview,omitempty"`
 	Error      string `json:"error"`

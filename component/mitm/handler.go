@@ -363,6 +363,14 @@ func (h *Handler) serveHTTP(w http.ResponseWriter, r *http.Request, base *C.Meta
 	if record.Path == "" {
 		record.Path = r.URL.Path
 	}
+	// 请求头 + 请求体预览（截断，便于拦截记录查看完整信息）
+	record.ReqHeaders = headerToMap(r.Header)
+	if r.Body != nil && r.Method != http.MethodGet && r.Method != http.MethodHead {
+		if body, err := io.ReadAll(io.LimitReader(r.Body, recordBodyPreviewLimit)); err == nil && len(body) > 0 {
+			r.Body = io.NopCloser(bytes.NewReader(body))
+			record.ReqBody = string(body)
+		}
+	}
 	if host == "sub.store" && strings.HasPrefix(record.Path, "/api/") {
 		if origin := r.Header.Get("Origin"); origin != "" {
 			w.Header().Set("Access-Control-Allow-Origin", origin)
@@ -466,6 +474,17 @@ func (h *Handler) serveHTTP(w http.ResponseWriter, r *http.Request, base *C.Meta
 	h.applyResponseScripts(resp)
 	h.applyResponseRewrites(resp)
 	removeHopByHop(resp.Header)
+	// 响应头 + 响应体预览（截断），用 MultiReader 恢复以便 io.Copy 读完整内容
+	record.RespHeaders = headerToMap(resp.Header)
+	if resp.Body != nil {
+		if preview, err := io.ReadAll(io.LimitReader(resp.Body, recordBodyPreviewLimit)); err == nil && len(preview) > 0 {
+			record.RespPreview = string(preview)
+			resp.Body = struct {
+				io.Reader
+				io.Closer
+			}{Reader: io.MultiReader(bytes.NewReader(preview), resp.Body), Closer: resp.Body}
+		}
+	}
 	copyHeader(w.Header(), resp.Header)
 	w.WriteHeader(resp.StatusCode)
 	written, copyErr := io.Copy(w, resp.Body)
@@ -881,6 +900,22 @@ func copyHeader(dst, src http.Header) {
 		}
 	}
 }
+
+// headerToMap 把请求/响应头转成首值 map（用于拦截记录展示）。
+func headerToMap(header http.Header) map[string]string {
+	if len(header) == 0 {
+		return nil
+	}
+	out := make(map[string]string, len(header))
+	for key, values := range header {
+		if len(values) > 0 {
+			out[key] = values[0]
+		}
+	}
+	return out
+}
+
+const recordBodyPreviewLimit = 8192
 
 type singleConnListener struct {
 	conn net.Conn
