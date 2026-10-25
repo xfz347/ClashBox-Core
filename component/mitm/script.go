@@ -371,7 +371,7 @@ func applyScriptRequest(result *scriptResult, request *http.Request) {
 			request.Host = parsed.Host
 		}
 	}
-	if result.headers != nil {
+	if len(result.headers) > 0 {
 		request.Header = make(http.Header)
 		for key, value := range result.headers {
 			request.Header.Set(key, value)
@@ -391,7 +391,7 @@ func applyScriptResponse(result *scriptResult, response *http.Response) {
 		response.StatusCode = result.status
 		response.Status = fmt.Sprintf("%d %s", result.status, http.StatusText(result.status))
 	}
-	if result.headers != nil {
+	if len(result.headers) > 0 {
 		response.Header = make(http.Header)
 		for key, value := range result.headers {
 			response.Header.Set(key, value)

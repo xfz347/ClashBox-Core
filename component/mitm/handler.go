@@ -2,6 +2,7 @@ package mitm
 
 import (
 	"bytes"
+	"compress/gzip"
 	"context"
 	"crypto/tls"
 	"encoding/json"
@@ -418,6 +419,9 @@ func (h *Handler) serveHTTP(w http.ResponseWriter, r *http.Request, base *C.Meta
 		}
 	}
 	removeHopByHop(outReq.Header)
+	if h.needsPlainBody(outReq) {
+		outReq.Header.Set("Accept-Encoding", "identity")
+	}
 	local := h.applyRequestScripts(outReq)
 	if local == nil {
 		local = h.applyRequestRewrites(outReq)
@@ -505,6 +509,23 @@ func (h *Handler) bodyLimit() int64 {
 	return 1 << 20
 }
 
+// needsPlainBody reports whether a response script targets this URL (so we must avoid a compressed body).
+func (h *Handler) needsPlainBody(req *http.Request) bool {
+	if h == nil || req == nil || req.URL == nil {
+		return false
+	}
+	full := req.URL.String()
+	for _, script := range h.scripts {
+		if script.phase != "http-response" {
+			continue
+		}
+		if re := cachedRegex(script.pattern); re != nil && re.MatchString(full) {
+			return true
+		}
+	}
+	return false
+}
+
 func (h *Handler) applyRequestScripts(req *http.Request) *localResponse {
 	for _, script := range h.scripts {
 		if script.phase != "http-request" {
@@ -582,11 +603,21 @@ func (h *Handler) applyResponseScripts(resp *http.Response) {
 			io.Reader
 			io.Closer
 		}{Reader: bytes.NewReader(data), Closer: original}
-		result, err := runScript(script, resp.Request, resp, data)
+		scriptBody := data
+		if enc := resp.Header.Get("Content-Encoding"); strings.Contains(strings.ToLower(enc), "gzip") {
+			if zr, zerr := gzip.NewReader(bytes.NewReader(data)); zerr == nil {
+				if plain, rerr := io.ReadAll(io.LimitReader(zr, limit+1)); rerr == nil {
+					scriptBody = plain
+				}
+				_ = zr.Close()
+			}
+		}
+		result, err := runScript(script, resp.Request, resp, scriptBody)
 		if err != nil {
 			log.Debugln("[MITM] response script %s failed: %v", script.pattern, err)
 			continue
 		}
+		log.Warnln("[MITM] response script matched url=%s status=%d bodySet=%v", requestURL, result.status, result.bodySet)
 		applyScriptResponse(result, resp)
 	}
 }

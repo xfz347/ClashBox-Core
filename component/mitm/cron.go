@@ -36,6 +36,7 @@ var (
 func UpdateCronScripts(scripts []CronScript) {
 	cronMu.Lock()
 	defer cronMu.Unlock()
+	log.Warnln("[cron] update: total=%d", len(scripts))
 
 	cronEntries = cronEntries[:0]
 	for _, s := range scripts {
@@ -52,6 +53,7 @@ func UpdateCronScripts(scripts []CronScript) {
 func SetCronTunActive(active bool) {
 	cronMu.Lock()
 	defer cronMu.Unlock()
+	log.Warnln("[cron] SetCronTunActive=%v", active)
 	if cronTunActive == active {
 		return
 	}
@@ -62,6 +64,7 @@ func SetCronTunActive(active bool) {
 // reconcileCronTickerLocked starts/stops the ticker based on (has scripts && TUN active).
 // Caller must hold cronMu.
 func reconcileCronTickerLocked() {
+	log.Warnln("[cron] reconcile: entries=%d tunActive=%v running=%v", len(cronEntries), cronTunActive, cronTicker != nil)
 	shouldRun := len(cronEntries) > 0 && cronTunActive
 	if shouldRun && cronTicker == nil {
 		cronTicker = time.NewTicker(30 * time.Second)
@@ -90,8 +93,12 @@ func cronLoop(t *time.Ticker, stop chan struct{}) {
 	}
 }
 
+// cronLocation: OHOS 应用进程的 TZ 常为 UTC(未设置 TZ 且无 /etc/localtime),
+// 而用户按本地时间设置 cron, 必须用本地时区(东八区)参与匹配。
+var cronLocation = time.FixedZone("CST", 8*3600)
+
 func tickCron() {
-	now := time.Now()
+	now := time.Now().In(cronLocation)
 	minuteStart := now.Truncate(time.Minute)
 
 	cronMu.Lock()
@@ -104,6 +111,7 @@ func tickCron() {
 		if !cronMatches(e.script.Schedule, now) {
 			continue
 		}
+		log.Warnln("[cron] fire script=%q schedule=%q at=%s", e.script.Name, e.script.Schedule, now.Format("15:04"))
 		// Guard: run at most once per minute.
 		if !e.lastRun.IsZero() && !e.lastRun.Before(minuteStart) {
 			continue
