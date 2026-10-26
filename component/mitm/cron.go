@@ -180,9 +180,90 @@ func cronMatches(schedule string, t time.Time) bool {
 	}
 	return matchCronField(fields[0], t.Minute(), 0, 59) &&
 		matchCronField(fields[1], t.Hour(), 0, 23) &&
-		matchCronField(fields[2], t.Day(), 1, 31) &&
+		matchCronDay(fields[2], t) &&
 		matchCronField(fields[3], int(t.Month()), 1, 12) &&
-		matchCronField(fields[4], int(t.Weekday()), 0, 6)
+		matchCronWeekday(fields[4], t)
+}
+
+// matchCronDay 支持高级日字段: L(月末)、L-n(倒数第n天)、nW(最近工作日)。
+func matchCronDay(field string, t time.Time) bool {
+	for _, part := range strings.Split(field, ",") {
+		part = strings.TrimSpace(strings.ToUpper(part))
+		lastDay := time.Date(t.Year(), t.Month()+1, 0, 0, 0, 0, 0, t.Location()).Day()
+		if part == "L" {
+			if t.Day() == lastDay {
+				return true
+			}
+			continue
+		}
+		if strings.HasPrefix(part, "L-") {
+			if offset, err := strconv.Atoi(part[2:]); err == nil && t.Day() == lastDay-offset {
+				return true
+			}
+			continue
+		}
+		if strings.HasSuffix(part, "W") {
+			if day, err := strconv.Atoi(part[:len(part)-1]); err == nil && t.Day() == nearestWeekday(day, t) {
+				return true
+			}
+			continue
+		}
+		if matchCronPart(part, t.Day(), 1, 31) {
+			return true
+		}
+	}
+	return false
+}
+
+// matchCronWeekday 支持 "n#k"(该月第k个星期n) 与 "nL"(该月最后一个星期n)。
+func matchCronWeekday(field string, t time.Time) bool {
+	for _, part := range strings.Split(field, ",") {
+		part = strings.TrimSpace(strings.ToUpper(part))
+		if idx := strings.IndexByte(part, '#'); idx > 0 {
+			weekday, err1 := strconv.Atoi(part[:idx])
+			nth, err2 := strconv.Atoi(part[idx+1:])
+			if err1 == nil && err2 == nil && int(t.Weekday()) == weekday && (t.Day()-1)/7+1 == nth {
+				return true
+			}
+			continue
+		}
+		if strings.HasSuffix(part, "L") && len(part) > 1 {
+			if weekday, err := strconv.Atoi(part[:len(part)-1]); err == nil && int(t.Weekday()) == weekday {
+				if t.Day()+7 > time.Date(t.Year(), t.Month()+1, 0, 0, 0, 0, 0, t.Location()).Day() {
+					return true
+				}
+			}
+			continue
+		}
+		if matchCronPart(part, int(t.Weekday()), 0, 6) {
+			return true
+		}
+	}
+	return false
+}
+
+// nearestWeekday 返回当月最接近 day 的工作日(跳过周六周日)。
+func nearestWeekday(day int, t time.Time) int {
+	lastDay := time.Date(t.Year(), t.Month()+1, 0, 0, 0, 0, 0, t.Location()).Day()
+	if day > lastDay {
+		day = lastDay
+	}
+	weekday := func(d int) time.Weekday {
+		return time.Date(t.Year(), t.Month(), d, 0, 0, 0, 0, t.Location()).Weekday()
+	}
+	switch weekday(day) {
+	case time.Saturday:
+		if day+2 <= lastDay {
+			return day + 2
+		}
+		return day - 1
+	case time.Sunday:
+		if day-2 >= 1 {
+			return day - 2
+		}
+		return day + 1
+	}
+	return day
 }
 
 func matchCronField(field string, value, min, max int) bool {

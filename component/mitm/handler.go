@@ -2,7 +2,6 @@ package mitm
 
 import (
 	"bytes"
-	"compress/gzip"
 	"context"
 	"crypto/tls"
 	"encoding/json"
@@ -519,7 +518,7 @@ func (h *Handler) needsPlainBody(req *http.Request) bool {
 		if script.phase != "http-response" {
 			continue
 		}
-		if re := cachedRegex(script.pattern); re != nil && re.MatchString(full) {
+		if rewriteMatches(script.pattern, full) {
 			return true
 		}
 	}
@@ -531,8 +530,7 @@ func (h *Handler) applyRequestScripts(req *http.Request) *localResponse {
 		if script.phase != "http-request" {
 			continue
 		}
-		re := cachedRegex(script.pattern)
-		if re == nil || !re.MatchString(req.URL.String()) {
+		if !rewriteMatches(script.pattern, req.URL.String()) {
 			continue
 		}
 		var body []byte
@@ -554,6 +552,7 @@ func (h *Handler) applyRequestScripts(req *http.Request) *localResponse {
 			log.Debugln("[MITM] request script %s failed: %v", script.pattern, err)
 			continue
 		}
+		log.Warnln("[MITM] request script %q matched url=%s", script.pattern, req.URL.String())
 		if result.statusSet || (result.bodySet && result.url == "" && result.method == "") {
 			status := result.status
 			if status <= 0 {
@@ -582,8 +581,7 @@ func (h *Handler) applyResponseScripts(resp *http.Response) {
 		if script.phase != "http-response" {
 			continue
 		}
-		re := cachedRegex(script.pattern)
-		if re == nil || !re.MatchString(requestURL) {
+		if !rewriteMatches(script.pattern, requestURL) {
 			continue
 		}
 		limit := h.bodyLimit()
@@ -603,21 +601,13 @@ func (h *Handler) applyResponseScripts(resp *http.Response) {
 			io.Reader
 			io.Closer
 		}{Reader: bytes.NewReader(data), Closer: original}
-		scriptBody := data
-		if enc := resp.Header.Get("Content-Encoding"); strings.Contains(strings.ToLower(enc), "gzip") {
-			if zr, zerr := gzip.NewReader(bytes.NewReader(data)); zerr == nil {
-				if plain, rerr := io.ReadAll(io.LimitReader(zr, limit+1)); rerr == nil {
-					scriptBody = plain
-				}
-				_ = zr.Close()
-			}
-		}
+		scriptBody := decompressBody(data, resp.Header.Get("Content-Encoding"))
 		result, err := runScript(script, resp.Request, resp, scriptBody)
 		if err != nil {
 			log.Debugln("[MITM] response script %s failed: %v", script.pattern, err)
 			continue
 		}
-		log.Warnln("[MITM] response script matched url=%s status=%d bodySet=%v", requestURL, result.status, result.bodySet)
+		log.Warnln("[MITM] response script %q matched url=%s status=%d bodySet=%v", script.pattern, requestURL, result.status, result.bodySet)
 		applyScriptResponse(result, resp)
 	}
 }
@@ -758,6 +748,7 @@ func (h *Handler) applyResponseRewrites(resp *http.Response) {
 	if err != nil || int64(len(data)) > limit {
 		return
 	}
+	data = decompressBody(data, resp.Header.Get("Content-Encoding"))
 	if hasJq {
 		data = h.applyJqRewrites(data, requestURL, "http-response-jq")
 	}
@@ -853,10 +844,31 @@ func applyHeaderAction(header http.Header, target string) {
 }
 
 func rewriteMatches(pattern string, value string) bool {
-	if strings.TrimSpace(pattern) == "" {
+	p := strings.TrimSpace(pattern)
+	if p == "" {
 		return true
 	}
-	re := cachedRegex(pattern)
+	// 条件组合: ! 取反, || 任一匹配, && 全部匹配
+	if strings.HasPrefix(p, "!") {
+		return !rewriteMatches(strings.TrimSpace(p[1:]), value)
+	}
+	if strings.Contains(p, "||") {
+		for _, part := range strings.Split(p, "||") {
+			if rewriteMatches(part, value) {
+				return true
+			}
+		}
+		return false
+	}
+	if strings.Contains(p, "&&") {
+		for _, part := range strings.Split(p, "&&") {
+			if !rewriteMatches(part, value) {
+				return false
+			}
+		}
+		return true
+	}
+	re := cachedRegex(p)
 	return re != nil && re.MatchString(value)
 }
 
