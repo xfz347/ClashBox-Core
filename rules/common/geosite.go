@@ -2,6 +2,7 @@ package common
 
 import (
 	"fmt"
+	"sync"
 
 	"github.com/metacubex/mihomo/component/geodata"
 	_ "github.com/metacubex/mihomo/component/geodata/memconservative"
@@ -13,9 +14,10 @@ import (
 
 type GEOSITE struct {
 	Base
-	country    string
-	adapter    string
-	recodeSize int
+	country     string
+	adapter     string
+	recodeSize  int
+	lazyErrOnce sync.Once
 }
 
 func (gs *GEOSITE) RuleType() C.RuleType {
@@ -33,6 +35,9 @@ func (gs *GEOSITE) MatchDomain(domain string) bool {
 	}
 	matcher, err := gs.GetDomainMatcher()
 	if err != nil {
+		gs.lazyErrOnce.Do(func() {
+			log.Warnln("[GeoSite] %s lazy load failed (rule will never match): %v", gs.country, err)
+		})
 		return false
 	}
 	return matcher.ApplyDomain(domain)
@@ -73,12 +78,11 @@ func NewGEOSITE(country string, adapter string) (*GEOSITE, error) {
 		adapter: adapter,
 	}
 
-	matcher, err := geoSite.GetDomainMatcher() // test load
-	if err != nil {
-		return nil, err
-	}
-
-	log.Infoln("Finished initial GeoSite rule %s => %s, records: %d", country, adapter, matcher.Count())
+	// ★ 懒加载(对齐 ProjectClash 的 lazy init 思路): 不在配置解析阶段解码 geosite,
+	//   冷启动的大头(.dat 解码 + 匹配树构建)推迟到首次命中;
+	//   startGeoDataPreload 会在启动后空闲时段主动预热配置里用到的分类,
+	//   避免把成本丢到首个请求上。分类名非法时在首次命中处告警(而非拒绝整份配置)。
+	log.Infoln("GeoSite rule %s => %s registered (lazy load)", country, adapter)
 
 	return geoSite, nil
 }

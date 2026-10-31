@@ -42,6 +42,9 @@ func UpdateCronScripts(scripts []CronScript) {
 	for _, s := range scripts {
 		if s.Enabled && strings.TrimSpace(s.Content) != "" && cronScheduleValid(s.Schedule) {
 			cronEntries = append(cronEntries, cronEntry{script: s})
+			log.Warnln("[cron] entry accepted: name=%q schedule=%q len(content)=%d", s.Name, s.Schedule, len(s.Content))
+		} else {
+			log.Warnln("[cron] entry skipped: name=%q schedule=%q enabled=%v len(content)=%d", s.Name, s.Schedule, s.Enabled, len(s.Content))
 		}
 	}
 
@@ -101,23 +104,26 @@ func tickCron() {
 	now := time.Now().In(cronLocation)
 	minuteStart := now.Truncate(time.Minute)
 
+	// ★ 必须在锁内直接修改 cronEntries 上的 lastRun:
+	//   之前把 entries 复制到局部切片再改 lastRun, 改动随切片丢弃,
+	//   "每分钟最多执行一次"去重失效, */1 会每 30s(每次 tick)执行一次。
+	var toRun []CronScript
 	cronMu.Lock()
-	entries := make([]cronEntry, len(cronEntries))
-	copy(entries, cronEntries)
-	cronMu.Unlock()
-
-	for i := range entries {
-		e := &entries[i]
+	for i := range cronEntries {
+		e := &cronEntries[i]
 		if !cronMatches(e.script.Schedule, now) {
 			continue
 		}
-		log.Warnln("[cron] fire script=%q schedule=%q at=%s", e.script.Name, e.script.Schedule, now.Format("15:04"))
-		// Guard: run at most once per minute.
 		if !e.lastRun.IsZero() && !e.lastRun.Before(minuteStart) {
 			continue
 		}
 		e.lastRun = now
-		script := e.script
+		log.Warnln("[cron] fire script=%q schedule=%q at=%s", e.script.Name, e.script.Schedule, now.Format("15:04"))
+		toRun = append(toRun, e.script)
+	}
+	cronMu.Unlock()
+
+	for _, script := range toRun {
 		go runCronScript(script)
 	}
 }

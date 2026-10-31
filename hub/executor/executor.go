@@ -443,6 +443,9 @@ func updateMITM(cfg *mitm.Config) {
 	}
 	tunnel.UpdateMITM(mitm.New(cfg, ca, tunnel.DialMITM))
 	log.Infoln("MITM is enabled for %d domain(s)", len(cfg.Domains))
+	// 诊断(Warn 级, 内核默认 log-level=warning 也能看到): 确认模块规则是否真的到达内核
+	log.Warnln("[MITM] loaded domains=%d rewrites=%d scripts=%d locals=%d httpRules=%d",
+		len(cfg.Domains), len(cfg.Rewrites), len(cfg.Scripts), len(cfg.LocalResponses), len(cfg.HTTPRules))
 }
 
 func updateCron() {

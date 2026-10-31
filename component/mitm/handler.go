@@ -26,6 +26,9 @@ import (
 )
 
 // DialFunc dials the target through the normal mihomo rule/outbound pipeline.
+// binaryBodyLimit 二进制响应体在命中脚本/规则时的最大缓存量, 超出按流式原样透传
+const binaryBodyLimit = 64 * 1024
+
 type DialFunc func(metadata *C.Metadata) (net.Conn, error)
 
 type compiledRewrite struct {
@@ -366,9 +369,17 @@ func (h *Handler) serveHTTP(w http.ResponseWriter, r *http.Request, base *C.Meta
 	// 请求头 + 请求体预览（截断，便于拦截记录查看完整信息）
 	record.ReqHeaders = headerToMap(r.Header)
 	if r.Body != nil && r.Method != http.MethodGet && r.Method != http.MethodHead {
-		if body, err := io.ReadAll(io.LimitReader(r.Body, recordBodyPreviewLimit)); err == nil && len(body) > 0 {
-			r.Body = io.NopCloser(bytes.NewReader(body))
-			record.ReqBody = string(body)
+		if preview, err := io.ReadAll(io.LimitReader(r.Body, recordBodyPreviewLimit)); err == nil && len(preview) > 0 {
+			// ★ 必须用 MultiReader 把已读部分拼回原始 body 再转发:
+			//   之前直接 r.Body = bytes.NewReader(preview) 会把 >8KB 的请求体截断,
+			//   但 Content-Length 仍是原值 → 上游收到残缺请求体返回 400
+			//   (实证: 微博开屏广告 /v2/ad/preload 29KB POST -> 400 Bad Request)。
+			original := r.Body
+			r.Body = struct {
+				io.Reader
+				io.Closer
+			}{Reader: io.MultiReader(bytes.NewReader(preview), original), Closer: original}
+			record.ReqBody = string(preview)
 		}
 	}
 	if host == "sub.store" && strings.HasPrefix(record.Path, "/api/") {
@@ -458,6 +469,17 @@ func (h *Handler) serveHTTP(w http.ResponseWriter, r *http.Request, base *C.Meta
 		return
 	}
 
+	// ★ 防御: 任何上游改写异常都可能让 scheme 变空, 这里兜底并留证(Warn 级可见)
+	if outReq.URL == nil || outReq.URL.Scheme == "" {
+		log.Warnln("[MITM] empty scheme before roundtrip: host=%q path=%q proto=%q origURL=%q", host, record.Path, r.Proto, r.URL.String())
+		if outReq.URL == nil {
+			outReq.URL = &url.URL{}
+		}
+		outReq.URL.Scheme = scheme
+		if outReq.URL.Host == "" {
+			outReq.URL.Host = r.Host
+		}
+	}
 	resp, err := transport.RoundTrip(outReq)
 	if err == nil && resp != nil {
 		if host == "sub.store" && resp.Header.Get("Location") == "https://sub-store.vercel.app/" {
@@ -499,6 +521,25 @@ func (h *Handler) serveHTTP(w http.ResponseWriter, r *http.Request, base *C.Meta
 		record.Error = copyErr.Error()
 	}
 	addRecord(record)
+}
+
+// bodyLimitForResponse 按 Content-Type 分档收窄响应体缓存上限(对齐 ProjectClash 的分档):
+// 文本类用配置上限, 二进制(图片/音视频/字体等)最多缓存 64KiB, 超出按流式原样透传。
+func (h *Handler) bodyLimitForResponse(resp *http.Response) int64 {
+	limit := h.bodyLimit()
+	if resp == nil {
+		return limit
+	}
+	ct := strings.ToLower(resp.Header.Get("Content-Type"))
+	if ct == "" || strings.HasPrefix(ct, "text/") || strings.Contains(ct, "json") ||
+		strings.Contains(ct, "javascript") || strings.Contains(ct, "xml") ||
+		strings.Contains(ct, "x-www-form-urlencoded") {
+		return limit
+	}
+	if limit > binaryBodyLimit {
+		return binaryBodyLimit
+	}
+	return limit
 }
 
 func (h *Handler) bodyLimit() int64 {
@@ -584,7 +625,7 @@ func (h *Handler) applyResponseScripts(resp *http.Response) {
 		if !rewriteMatches(script.pattern, requestURL) {
 			continue
 		}
-		limit := h.bodyLimit()
+		limit := h.bodyLimitForResponse(resp)
 		data, err := io.ReadAll(io.LimitReader(resp.Body, limit+1))
 		if err != nil {
 			continue
@@ -632,9 +673,14 @@ func (h *Handler) applyRequestRewrites(req *http.Request) *localResponse {
 			re := cachedRegex(rewrite.pattern)
 			if re != nil && re.MatchString(full) {
 				replaced := re.ReplaceAllString(full, rewrite.target)
-				if parsed, err := url.Parse(replaced); err == nil {
+				parsed, err := url.Parse(replaced)
+				// ★ 只接受绝对 http/https URL: 只替换成相对路径或非法串会让 req.URL.Scheme 变空,
+				//   随后 RoundTrip 报 `unsupported protocol scheme ""`, 请求直接失败。
+				if err == nil && parsed.Host != "" && (parsed.Scheme == "http" || parsed.Scheme == "https") {
 					req.URL = parsed
 					req.Host = parsed.Host
+				} else {
+					log.Warnln("[MITM] skip invalid url rewrite: pattern=%q target=%q result=%q", rewrite.pattern, rewrite.target, replaced)
 				}
 			}
 		case "header":
@@ -654,7 +700,17 @@ func (h *Handler) applyRequestRewrites(req *http.Request) *localResponse {
 		case "reject":
 			re := cachedRegex(rewrite.pattern)
 			if re != nil && re.MatchString(req.URL.String()) {
-				return &localResponse{status: http.StatusForbidden, body: []byte("Blocked by module")}
+				// ★ target 携带模块声明的状态码(reject-200 / reject(404) / reject-img):
+				//   2xx 用空 body(模块用它"清空"广告接口), 其他用 403 + 提示文本。
+				status := http.StatusForbidden
+				if code, err := strconv.Atoi(strings.TrimSpace(rewrite.target)); err == nil && code >= 200 && code <= 599 {
+					status = code
+				}
+				var body []byte
+				if status >= 300 {
+					body = []byte("Blocked by module")
+				}
+				return &localResponse{status: status, body: body}
 			}
 		case "redirect":
 			re := cachedRegex(rewrite.pattern)

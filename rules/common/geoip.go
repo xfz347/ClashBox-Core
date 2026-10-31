@@ -219,12 +219,10 @@ func NewGEOIP(country string, adapter string, isSrc, noResolveIP bool) (*GEOIP, 
 		return nil, err
 	}
 
+	// ★ 懒加载: geodata 模式下不再在解析阶段解码 geoip.dat/metadb,
+	//   推迟到首次命中(先由 startGeoDataPreload 在空闲时段预热)。
 	if geodata.GeodataMode() {
-		geoIPMatcher, err := geoip.getIPMatcher() // test load
-		if err != nil {
-			return nil, err
-		}
-		log.Infoln("Finished initial GeoIP rule %s => %s, records: %d", country, adapter, geoIPMatcher.Count())
+		log.Infoln("GeoIP rule %s => %s registered (lazy load)", country, adapter)
 	}
 
 	return geoip, nil

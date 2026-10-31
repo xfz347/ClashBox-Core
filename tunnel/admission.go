@@ -2,6 +2,7 @@ package tunnel
 
 import (
 	"context"
+	"fmt"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -12,18 +13,51 @@ import (
 
 // 并发连接/拨号准入门控: 极端场景(连接风暴/恶意扫描)下封顶内存峰值。
 // 超限时拒绝新会话, 已建立会话不受影响。
+// 分两档: 普通水位用标准档; 内存压力(armed/triggered)时收紧到低内存档,
+// 由 SetAdmissionLimits 切换(对齐 ProjectClash 的 low-memory admission)。
 const (
-	tcpConnAdmitLimit = 1024
-	udpDialAdmitLimit = 256
+	tcpConnAdmitLimitStandard  = 1024
+	udpDialAdmitLimitStandard  = 256
+	tcpConnAdmitLimitLowMemory = 416
+	udpDialAdmitLimitLowMemory = 128
 )
 
 var (
 	tcpConnCount atomic.Int64
 	udpDialCount atomic.Int64
+
+	tcpAdmitLimit atomic.Int64
+	udpAdmitLimit atomic.Int64
 )
 
+func init() {
+	tcpAdmitLimit.Store(tcpConnAdmitLimitStandard)
+	udpAdmitLimit.Store(udpDialAdmitLimitStandard)
+}
+
+// SetAdmissionLimits 按内存压力切换准入上限: 只影响新会话, 已建立会话不受影响。
+func SetAdmissionLimits(lowMemory bool) {
+	tcp := int64(tcpConnAdmitLimitStandard)
+	udp := int64(udpDialAdmitLimitStandard)
+	if lowMemory {
+		tcp = tcpConnAdmitLimitLowMemory
+		udp = udpDialAdmitLimitLowMemory
+	}
+	oldTCP := tcpAdmitLimit.Swap(tcp)
+	oldUDP := udpAdmitLimit.Swap(udp)
+	if oldTCP != tcp || oldUDP != udp {
+		log.Warnln("[Admission] limits switched: tcp=%d udp=%d lowMemory=%v", tcp, udp, lowMemory)
+	}
+}
+
+// AdmissionSnapshot 当前准入状态(诊断用)
+func AdmissionSnapshot() string {
+	return fmt.Sprintf("tcp %d/%d udp %d/%d", tcpConnCount.Load(), tcpAdmitLimit.Load(),
+		udpDialCount.Load(), udpAdmitLimit.Load())
+}
+
 func admitTCPConn() bool {
-	if n := tcpConnCount.Add(1); n > tcpConnAdmitLimit {
+	if n := tcpConnCount.Add(1); n > tcpAdmitLimit.Load() {
 		tcpConnCount.Add(-1)
 		return false
 	}
@@ -35,7 +69,7 @@ func releaseTCPConn() {
 }
 
 func admitUDPDial() bool {
-	if n := udpDialCount.Add(1); n > udpDialAdmitLimit {
+	if n := udpDialCount.Add(1); n > udpAdmitLimit.Load() {
 		udpDialCount.Add(-1)
 		return false
 	}

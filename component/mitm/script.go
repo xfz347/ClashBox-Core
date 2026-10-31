@@ -35,6 +35,9 @@ type scriptResult struct {
 	statusSet  bool
 }
 
+// errScriptSkippedLowMemory 内存不足时跳过脚本(调用方按不修改处理)
+var errScriptSkippedLowMemory = fmt.Errorf("script skipped: low available memory")
+
 var scriptStore sync.Map
 
 // ExternalScriptResult is the result returned by an embedded WebView script host.
@@ -62,6 +65,10 @@ func runScript(script compiledScript, request *http.Request, response *http.Resp
 	}()
 	if ExternalScriptExecutor == nil {
 		return nil, fmt.Errorf("external script executor is not initialized")
+	}
+	// 内存准入: 可用内存过低时跳过脚本, 请求/响应按原样透传(避免 OOM)
+	if scriptShouldSkip(script.pattern) {
+		return nil, errScriptSkippedLowMemory
 	}
 	{
 		external, err := ExternalScriptExecutor(Script{
