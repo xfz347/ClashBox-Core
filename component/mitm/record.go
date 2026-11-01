@@ -51,6 +51,41 @@ func Records() []Record {
 	return out
 }
 
+
+// RecordsSummary 返回最近 limit 条记录, 并剥离体积大的字段(请求/响应体与头),
+// 供拦截记录列表页使用——避免一次把数 MB 的 body 全量传给 UI 造成卡顿。
+func RecordsSummary(limit int) []Record {
+	recordStore.RLock()
+	defer recordStore.RUnlock()
+	total := len(recordStore.items)
+	if limit <= 0 || limit > total {
+		limit = total
+	}
+	out := make([]Record, limit)
+	for i := 0; i < limit; i++ {
+		src := recordStore.items[total-limit+i]
+		src.ReqBody = ""
+		src.RespPreview = ""
+		src.ReqHeaders = nil
+		src.RespHeaders = nil
+		out[i] = src
+	}
+	return out
+}
+
+// RecordDetail 按 (time, host, path) 查找一条完整记录(含 body/headers)。
+func RecordDetail(ts int64, host, path string) (Record, bool) {
+	recordStore.RLock()
+	defer recordStore.RUnlock()
+	for i := len(recordStore.items) - 1; i >= 0; i-- {
+		item := recordStore.items[i]
+		if item.Time == ts && item.Host == host && item.Path == path {
+			return item, true
+		}
+	}
+	return Record{}, false
+}
+
 // ClearRecords drops all buffered transactions.
 func ClearRecords() {
 	recordStore.Lock()
