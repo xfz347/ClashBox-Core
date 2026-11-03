@@ -34,3 +34,20 @@ func SetLowMemoryMode(low bool) {
 func IsLowMemoryMode() bool {
 	return lowMemoryMode.Load()
 }
+
+// SetUltraLowMemoryMode 内存压力最高档: relay/UDP 缓冲降到 2KB, 进一步压缩内存峰值。
+// 关闭时回到低内存档(如果仍处于低内存模式)或标准档。
+func SetUltraLowMemoryMode(ultra bool) {
+	if ultra {
+		RelayBufferSize = 2 * 1024
+		UDPBufferSize = 2 * 1024
+		return
+	}
+	if lowMemoryMode.Load() {
+		RelayBufferSize = relaySizeLowMemory
+		UDPBufferSize = udpSizeLowMemory
+	} else {
+		RelayBufferSize = relaySizeStandard
+		UDPBufferSize = udpSizeStandard
+	}
+}

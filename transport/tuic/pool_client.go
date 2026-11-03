@@ -136,3 +136,30 @@ func NewPoolClientV5(clientOption *ClientOptionV5, dialFn DialFunc) *PoolClient 
 	p.newClientOptionV5 = &newClientOption
 	return p
 }
+
+// ReleaseIdle 释放空闲的 TCP 客户端(无打开流且 10 分钟未访问)。
+// UDP 客户端可能与活跃会话绑定, 交给 getClient 的 30 分钟保守回收。
+func (t *PoolClient) ReleaseIdle() bool {
+	t.tcpClientsMutex.Lock()
+	defer t.tcpClientsMutex.Unlock()
+	released := false
+	for it := t.tcpClients.Front(); it != nil; {
+		client := it.Value
+		if client == nil {
+			next := it.Next()
+			t.tcpClients.Remove(it)
+			it = next
+			continue
+		}
+		if client.OpenStreams() == 0 && time.Now().Sub(client.LastVisited()) > 10*time.Minute {
+			client.Close()
+			next := it.Next()
+			t.tcpClients.Remove(it)
+			released = true
+			it = next
+			continue
+		}
+		it = it.Next()
+	}
+	return released
+}

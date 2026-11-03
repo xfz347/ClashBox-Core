@@ -1014,7 +1014,7 @@ func headerToMap(header http.Header) map[string]string {
 	return out
 }
 
-const recordBodyPreviewLimit = 8192
+const recordBodyPreviewLimit = 4096
 
 type singleConnListener struct {
 	conn net.Conn
@@ -1035,4 +1035,20 @@ func (l *singleConnListener) Close() error {
 
 func (l *singleConnListener) Addr() net.Addr {
 	return l.conn.LocalAddr()
+}
+
+// ClearCaches 释放 MITM 正则/JQ 编译缓存, 供内存压力/手动 Trim 时调用。
+func ClearCaches() int {
+	n := 0
+	mitmRegexCache.Range(func(key, _ any) bool {
+		mitmRegexCache.Delete(key)
+		n++
+		return true
+	})
+	mitmJqCache.Range(func(key, _ any) bool {
+		mitmJqCache.Delete(key)
+		n++
+		return true
+	})
+	return n
 }

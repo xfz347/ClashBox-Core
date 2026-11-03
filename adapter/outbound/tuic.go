@@ -298,3 +298,11 @@ func NewTuic(option TuicOption) (*Tuic, error) {
 
 	return t, nil
 }
+
+// ReleaseSessions 空闲释放: 关闭 10 分钟未访问且无打开流的 TUIC TCP 客户端。
+func (t *Tuic) ReleaseSessions() bool {
+	if t.client == nil {
+		return false
+	}
+	return t.client.ReleaseIdle()
+}

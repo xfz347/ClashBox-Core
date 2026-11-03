@@ -13,13 +13,24 @@ import (
 
 // 脚本执行内存准入(对齐 ProjectClash 的模块内存阶梯):
 // 可用内存过低时直接跳过脚本执行(请求/响应按原样透传), 而不是在 OOM 边缘
-// 继续起 goja 运行时。阈值取 96MiB, 低于它时只保留代理转发能力。
-
-const scriptMemoryFloorBytes = 96 * 1024 * 1024
+// 继续起脚本运行时。
+//
+// - floor: 低于它时按脚本体量估算本次执行成本, 不够就跳过
+// - relief: 高于它才恢复正常执行
+// - hold: 触发后 30s 内保持跳过, 避免内存抖动导致脚本反复启停
+const (
+	scriptMemoryFloorBytes  = 96 * 1024 * 1024
+	scriptMemoryReliefBytes = 128 * 1024 * 1024
+	scriptBaseCostBytes     = 8 * 1024 * 1024
+	scriptCostFactor        = 4
+	scriptMemoryHoldSeconds = 30
+)
 
 var (
 	lastSkipLogAt atomic.Int64
 	skippedTotal  atomic.Int64
+	// lowMemoryUntil: 触发阶梯后保持跳过的截止时间(unix 秒)
+	lowMemoryUntil atomic.Int64
 )
 
 // scriptMemoryAvailable 读取 MemAvailable(字节)。
@@ -48,18 +59,35 @@ func scriptMemoryAvailable() (uint64, bool) {
 	return 0, false
 }
 
-// scriptShouldSkip 内存不足时返回 true(带日志节流, 最多每 30s 一条)。
-func scriptShouldSkip(pattern string) bool {
+// scriptShouldSkip 按"可用内存 + 脚本体量 + 滞回"判断是否跳过脚本。
+func scriptShouldSkip(pattern string, scriptBytes int) bool {
+	now := time.Now().Unix()
+	if lowMemoryUntil.Load() > now {
+		skippedTotal.Add(1)
+		return true
+	}
 	avail, ok := scriptMemoryAvailable()
-	if !ok || avail >= scriptMemoryFloorBytes {
+	if !ok {
 		return false
 	}
+	// 内存充足时直接放行
+	if avail >= scriptMemoryReliefBytes {
+		return false
+	}
+	cost := uint64(scriptBaseCostBytes)
+	if scriptBytes > 0 {
+		cost += uint64(scriptBytes) * scriptCostFactor
+	}
+	if avail > scriptMemoryFloorBytes+cost {
+		return false
+	}
+	lowMemoryUntil.Store(now + scriptMemoryHoldSeconds)
 	n := skippedTotal.Add(1)
-	now := time.Now().Unix()
+	nowUnix := time.Now().Unix()
 	last := lastSkipLogAt.Load()
-	if now-last >= 30 && lastSkipLogAt.CompareAndSwap(last, now) {
-		log.Warnln("[MITM] scripts skipped for low memory: %s available, %d skipped so far (pattern %s)",
-			formatMiB(avail), n, pattern)
+	if nowUnix-last >= 30 && lastSkipLogAt.CompareAndSwap(last, nowUnix) {
+		log.Warnln("[MITM] scripts skipped for low memory: %s available, script=%dB, %d skipped so far (pattern %s)",
+			formatMiB(avail), scriptBytes, n, pattern)
 	}
 	return true
 }

@@ -31,9 +31,33 @@ type CA struct {
 	key     *ecdsa.PrivateKey
 	certPEM []byte
 	leafKey *ecdsa.PrivateKey
+	dir     string
 
 	mu    sync.Mutex
 	cache map[string]*tls.Certificate
+}
+
+// caRegistry 记录进程内 CA 实例, 供内存压力时清理 leaf 证书内存缓存(磁盘缓存保留)。
+var caRegistry sync.Map
+
+// ClearLeafCaches 清理所有 CA 的内存 leaf 缓存, 返回释放条目数。
+func ClearLeafCaches() int {
+	n := 0
+	caRegistry.Range(func(key, _ any) bool {
+		if ca, ok := key.(*CA); ok {
+			n += ca.clearMemoryCache()
+		}
+		return true
+	})
+	return n
+}
+
+func (ca *CA) clearMemoryCache() int {
+	ca.mu.Lock()
+	defer ca.mu.Unlock()
+	n := len(ca.cache)
+	ca.cache = make(map[string]*tls.Certificate)
+	return n
 }
 
 // LoadOrCreateCA loads the CA from dir, generating it on first use.
@@ -79,6 +103,7 @@ func LoadOrCreateCA(dir string) (*CA, error) {
 			key:     key,
 			certPEM: certPEM,
 			leafKey: leafKey,
+			dir:     dir,
 			cache:   make(map[string]*tls.Certificate),
 		}, nil
 	} else if !os.IsNotExist(err) {
@@ -87,7 +112,7 @@ func LoadOrCreateCA(dir string) (*CA, error) {
 
 	var lastErr error
 	for attempt := 0; attempt < 3; attempt++ {
-		ca, err := createAndWriteCA(certPath, keyPath)
+		ca, err := createAndWriteCA(dir, certPath, keyPath)
 		if err == nil {
 			return ca, nil
 		}
@@ -97,7 +122,7 @@ func LoadOrCreateCA(dir string) (*CA, error) {
 	return nil, fmt.Errorf("generate CA failed after 3 attempts: %w", lastErr)
 }
 
-func createAndWriteCA(certPath, keyPath string) (*CA, error) {
+func createAndWriteCA(dir, certPath, keyPath string) (*CA, error) {
 	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
 	if err != nil {
 		return nil, fmt.Errorf("generate CA private key (ECDSA P-256): %w", err)
@@ -149,6 +174,7 @@ func createAndWriteCA(certPath, keyPath string) (*CA, error) {
 		key:     key,
 		certPEM: certPEM,
 		leafKey: leafKey,
+		dir:     dir,
 		cache:   make(map[string]*tls.Certificate),
 	}, nil
 }
@@ -183,9 +209,15 @@ func (ca *CA) GetCertificate(hello *tls.ClientHelloInfo) (*tls.Certificate, erro
 }
 
 func (ca *CA) certificateForHost(host string) (*tls.Certificate, error) {
+	caRegistry.Store(ca, struct{}{})
 	ca.mu.Lock()
 	defer ca.mu.Unlock()
 	if cert, ok := ca.cache[host]; ok {
+		return cert, nil
+	}
+	// 磁盘 leaf 缓存(对齐 ProjectClash ModuleLeafStore): 重启后免重新签发
+	if cert, ok := ca.loadLeafCert(host); ok {
+		ca.cache[host] = cert
 		return cert, nil
 	}
 	serial, err := randomSerial()
@@ -214,6 +246,80 @@ func (ca *CA) certificateForHost(host string) (*tls.Certificate, error) {
 		Certificate: [][]byte{der, ca.cert.Raw},
 		PrivateKey:  ca.leafKey,
 	}
+	ca.saveLeafCert(host, der)
 	ca.cache[host] = cert
 	return cert, nil
+}
+
+func (ca *CA) leafCachePath(host string) string {
+	sum := sha256.Sum256([]byte(host))
+	return filepath.Join(ca.dir, "leaves", hex.EncodeToString(sum[:16])+".pem")
+}
+
+// loadLeafCert 读取磁盘缓存的 leaf 证书(证书+私钥), 过期则视为未命中。
+func (ca *CA) loadLeafCert(host string) (*tls.Certificate, bool) {
+	if ca.dir == "" {
+		return nil, false
+	}
+	data, err := os.ReadFile(ca.leafCachePath(host))
+	if err != nil {
+		return nil, false
+	}
+	var leaf *x509.Certificate
+	var key *ecdsa.PrivateKey
+	rest := data
+	for len(rest) > 0 {
+		block, next := pem.Decode(rest)
+		if block == nil {
+			break
+		}
+		rest = next
+		switch block.Type {
+		case "CERTIFICATE":
+			if parsed, parseErr := x509.ParseCertificate(block.Bytes); parseErr == nil {
+				leaf = parsed
+			}
+		case "EC PRIVATE KEY":
+			if parsed, parseErr := x509.ParseECPrivateKey(block.Bytes); parseErr == nil {
+				key = parsed
+			}
+		}
+	}
+	if leaf == nil || key == nil {
+		return nil, false
+	}
+	now := time.Now()
+	if now.Before(leaf.NotBefore) || now.After(leaf.NotAfter) {
+		return nil, false
+	}
+	return &tls.Certificate{
+		Certificate: [][]byte{leaf.Raw, ca.cert.Raw},
+		PrivateKey:  key,
+		Leaf:        leaf,
+	}, true
+}
+
+// saveLeafCert 原子写入 leaf 证书与私钥; 失败不影响本次握手。
+func (ca *CA) saveLeafCert(host string, der []byte) {
+	if ca.dir == "" {
+		return
+	}
+	leafDir := filepath.Join(ca.dir, "leaves")
+	if err := os.MkdirAll(leafDir, 0o700); err != nil {
+		return
+	}
+	keyDER, err := x509.MarshalECPrivateKey(ca.leafKey)
+	if err != nil {
+		return
+	}
+	payload := append(pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der}),
+		pem.EncodeToMemory(&pem.Block{Type: "EC PRIVATE KEY", Bytes: keyDER})...)
+	path := ca.leafCachePath(host)
+	tmp := path + ".tmp"
+	if err := os.WriteFile(tmp, payload, 0o600); err != nil {
+		return
+	}
+	if err := os.Rename(tmp, path); err != nil {
+		_ = os.Remove(tmp)
+	}
 }

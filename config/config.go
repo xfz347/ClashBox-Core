@@ -378,9 +378,10 @@ type RawMITMScript struct {
 }
 
 type RawModuleProvider struct {
-	Name   string `yaml:"name" json:"name"`
-	Path   string `yaml:"path" json:"path"`
-	Target string `yaml:"target" json:"target"`
+	Name     string `yaml:"name" json:"name"`
+	Path     string `yaml:"path" json:"path"`
+	Target   string `yaml:"target" json:"target"`
+	Behavior string `yaml:"behavior" json:"behavior"`
 }
 
 type RawMITMJq struct {

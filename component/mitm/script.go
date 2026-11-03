@@ -25,14 +25,14 @@ type compiledScript struct {
 }
 
 type scriptResult struct {
-	done       bool
-	url        string
-	method     string
-	headers    map[string]string
-	body       []byte
-	bodySet    bool
-	status     int
-	statusSet  bool
+	done      bool
+	url       string
+	method    string
+	headers   map[string]string
+	body      []byte
+	bodySet   bool
+	status    int
+	statusSet bool
 }
 
 // errScriptSkippedLowMemory 内存不足时跳过脚本(调用方按不修改处理)
@@ -67,7 +67,7 @@ func runScript(script compiledScript, request *http.Request, response *http.Resp
 		return nil, fmt.Errorf("external script executor is not initialized")
 	}
 	// 内存准入: 可用内存过低时跳过脚本, 请求/响应按原样透传(避免 OOM)
-	if scriptShouldSkip(script.pattern) {
+	if scriptShouldSkip(script.pattern, len(script.content)) {
 		return nil, errScriptSkippedLowMemory
 	}
 	{
