@@ -179,6 +179,7 @@ type DNS struct {
 	ProxyServerPolicy     []dns.Policy
 	DirectNameServer      []dns.NameServer
 	DirectFollowPolicy    bool
+	StrictV4              bool
 }
 
 // Profile config
@@ -254,6 +255,7 @@ type RawDNS struct {
 	ProxyServerNameserverPolicy  *orderedmap.OrderedMap[string, any] `yaml:"proxy-server-nameserver-policy" json:"proxy-server-nameserver-policy"`
 	DirectNameServer             []string                            `yaml:"direct-nameserver" json:"direct-nameserver"`
 	DirectNameServerFollowPolicy bool                                `yaml:"direct-nameserver-follow-policy" json:"direct-nameserver-follow-policy"`
+	StrictV4                     bool                                `yaml:"strict-v4" json:"strict-v4"`
 }
 
 type RawFallbackFilter struct {
@@ -1586,6 +1588,7 @@ func parseDNS(rawCfg *RawConfig, ruleProviders map[string]P.RuleProvider) (*DNS,
 		return nil, err
 	}
 	dnsCfg.DirectFollowPolicy = cfg.DirectNameServerFollowPolicy
+	dnsCfg.StrictV4 = cfg.StrictV4
 
 	if len(cfg.DefaultNameserver) == 0 {
 		return nil, errors.New("default nameserver should have at least one nameserver")

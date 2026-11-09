@@ -138,10 +138,23 @@ func transform(servers []NameServer, resolver resolver.Resolver) []dnsClient {
 			c = newClient(s.Addr, resolver, s.Net, s.Params, s.ProxyAdapter, s.ProxyName)
 		}
 		c = rewrapClient(c, s.Params)
+		if s.Params["backup"] == "true" {
+			c = backupClient{c}
+		}
 		ret = append(ret, c)
 	}
 	return ret
 }
+
+// backupClient marks a nameserver as a fallback candidate: it only participates
+// in resolution after every primary nameserver has failed (see batchExchange).
+// Configured via the "#backup=true" fragment parameter, e.g. "223.5.5.5#backup=true".
+type backupClient struct {
+	dnsClient
+}
+
+func (b backupClient) IsBackup() bool    { return true }
+func (b backupClient) Unwrap() dnsClient { return b.dnsClient }
 
 // rewrapClient peels any existing wrapper layers off c to reach the raw transport
 // client, then re-wraps it according to params. Passing a raw client is fine (the
@@ -413,8 +426,44 @@ func msgToLogString(msg *D.Msg) string {
 }
 
 func batchExchange(ctx context.Context, clients []dnsClient, m *D.Msg) (msg *D.Msg, cache bool, err error) {
+	// Two-stage exchange: nameservers marked with "#backup=true" only run after
+	// all primary nameservers failed, so a plaintext fallback (e.g. injected
+	// link DNS or 223.5.5.5) can never win the concurrent race and drown out
+	// the answers (0.0.0.0/NXDOMAIN) of an explicitly configured encrypted DNS.
+	primary := make([]dnsClient, 0, len(clients))
+	backup := make([]dnsClient, 0, len(clients))
+	for _, client := range clients {
+		if b, ok := client.(interface{ IsBackup() bool }); ok && b.IsBackup() {
+			backup = append(backup, client)
+		} else {
+			primary = append(primary, client)
+		}
+	}
+	if len(primary) == 0 && len(backup) != 0 {
+		// every nameserver is marked backup (odd config): degrade to the
+		// original concurrent behavior instead of resolving nothing.
+		primary, backup = backup, nil
+	}
+	// split the outer deadline so the backup stage still gets its fair share
+	// when the primary stage stalls until the timeout (e.g. silently dropped).
+	stage1 := resolver.DefaultDNSTimeout
+	if deadline, ok := ctx.Deadline(); ok {
+		if remain := time.Until(deadline); remain <= 2*resolver.DefaultDNSTimeout {
+			stage1 = remain / 2
+		}
+	}
+	msg, cache, err = exchangeGroup(ctx, primary, m, stage1)
+	if err == nil || len(backup) == 0 {
+		return
+	}
+	log.Debugln("[DNS] primary nameservers all failed, trying %d backup servers", len(backup))
+	msg, cache, err = exchangeGroup(ctx, backup, m, resolver.DefaultDNSTimeout)
+	return
+}
+
+func exchangeGroup(ctx context.Context, clients []dnsClient, m *D.Msg, timeout time.Duration) (msg *D.Msg, cache bool, err error) {
 	cache = true
-	fast, ctx := picker.WithTimeout[*D.Msg](ctx, resolver.DefaultDNSTimeout)
+	fast, ctx := picker.WithTimeout[*D.Msg](ctx, timeout)
 	defer fast.Close()
 	domain := msgToDomain(m)
 	_, qTypeStr := msgToQtype(m)

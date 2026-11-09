@@ -128,6 +128,24 @@ func tickCron() {
 	}
 }
 
+func FireCronScript(name string) string {
+	cronMu.Lock()
+	var found *CronScript
+	for i := range cronEntries {
+		if cronEntries[i].script.Name == name {
+			found = &cronEntries[i].script
+			break
+		}
+	}
+	cronMu.Unlock()
+	if found == nil {
+		return `{"ok":false,"error":"not found"}`
+	}
+	go runCronScript(*found)
+	log.Warnln("[cron] manual fire: name=%q", name)
+	return `{"ok":true}`
+}
+
 func runCronScript(script CronScript) {
 	defer func() {
 		if r := recover(); r != nil {

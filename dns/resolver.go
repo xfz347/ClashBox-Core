@@ -556,6 +556,9 @@ func NewResolver(config Config) (rs Resolvers) {
 				}
 				dc = built[0]
 			}
+			if ns.Params["backup"] == "true" { // re-apply the backup marker: rewrapClient peels it via Unwrap()
+				dc = backupClient{dc}
+			}
 			nameServerCache = append(nameServerCache, struct {
 				NameServer
 				dnsClient

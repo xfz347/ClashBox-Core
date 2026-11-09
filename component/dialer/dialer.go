@@ -355,16 +355,26 @@ func parallelDialContext(ctx context.Context, network string, ips []netip.Addr, 
 	return nil, os.ErrDeadlineExceeded
 }
 
+// serialDialAttemptTimeout 串行拨号时单个 IP 的连接预算。
+// ★ 首个 IP 静默丢包(SYN 无响应)时若一直等到整个 ctx 超时, 后续可用 IP 永远轮不到
+// (典型: 机场多 IP 池首个 IP 晚高峰被墙, 非 tcp-concurrent 模式下节点全部超时)。
+const serialDialAttemptTimeout = 2 * time.Second
+
 func serialDialContext(ctx context.Context, network string, ips []netip.Addr, port string, opt option) (net.Conn, error) {
 	if len(ips) == 0 {
 		return nil, ErrorNoIpAddress
 	}
 	var errs []error
 	for _, ip := range ips {
-		if conn, err := dialContext(ctx, network, ip, port, opt); err == nil {
+		attemptCtx, cancel := context.WithTimeout(ctx, serialDialAttemptTimeout)
+		conn, err := dialContext(attemptCtx, network, ip, port, opt)
+		cancel()
+		if err == nil {
 			return conn, nil
-		} else {
-			errs = append(errs, err)
+		}
+		errs = append(errs, err)
+		if ctx.Err() != nil {
+			break
 		}
 	}
 	return nil, errors.Join(errs...)

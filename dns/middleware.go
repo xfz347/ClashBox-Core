@@ -1,6 +1,7 @@
 package dns
 
 import (
+	"context"
 	"net/netip"
 	"strings"
 	"time"
@@ -146,7 +147,39 @@ func withMapping(mapping *lru.LruCache[netip.Addr, string]) middleware {
 	}
 }
 
-func withFakeIP(skipper *fakeip.Skipper, fakePool *fakeip.Pool, fakePool6 *fakeip.Pool, fakeIPTTL int) middleware {
+// hasRealARecord 通过主 resolver 的上游解析链(含并发取最快与 fallback 过滤,
+// 结果受 DNS 缓存加速)同步查询域名的真实 A 记录。仅在共识明确为
+// "NOERROR 且 answer 中无任何 A 记录"时返回 false; NXDOMAIN/REFUSED/
+// SERVFAIL/超时/错误一律返回 true(可用性优先, 避免污染或上游故障误伤)。
+// 调用的是出站解析链, 不经过 inbound middleware, 无递归风险。
+func hasRealARecord(ctx *icontext.DNSContext, rsv resolver.Resolver, host string) bool {
+	if rsv == nil {
+		return true
+	}
+
+	m := &D.Msg{}
+	m.SetQuestion(D.Fqdn(host), D.TypeA)
+	m.RecursionDesired = true
+
+	qCtx, cancel := context.WithTimeout(ctx, resolver.DefaultDNSTimeout)
+	defer cancel()
+
+	ans, err := rsv.ExchangeContext(qCtx, m)
+	if err != nil || ans == nil {
+		return true
+	}
+	if ans.Rcode != D.RcodeSuccess {
+		return true
+	}
+	for _, rr := range ans.Answer {
+		if _, ok := rr.(*D.A); ok {
+			return true
+		}
+	}
+	return false
+}
+
+func withFakeIP(skipper *fakeip.Skipper, fakePool *fakeip.Pool, fakePool6 *fakeip.Pool, fakeIPTTL int, strictV4 bool, rsv resolver.Resolver) middleware {
 	return func(next handler) handler {
 		return func(ctx *icontext.DNSContext, r *D.Msg) (*D.Msg, error) {
 			q := r.Question[0]
@@ -160,6 +193,13 @@ func withFakeIP(skipper *fakeip.Skipper, fakePool *fakeip.Pool, fakePool6 *fakei
 			switch q.Qtype {
 			case D.TypeA:
 				if fakePool == nil {
+					return handleMsgWithEmptyAnswer(r), nil
+				}
+				if strictV4 && !hasRealARecord(ctx, rsv, host) {
+					// strict-v4: 域名经完整解析链确认无任何真实 A 记录,
+					// 不再分配 fake-ip。否则仅 v6 域名会以"域名"到达节点,
+					// 被节点强制 v6 出站, 导致 ipv6 关闭时仍显示节点 v6。
+					log.Debugln("[DNS] strict-v4: no real A record for %s, suppress fake-ip", host)
 					return handleMsgWithEmptyAnswer(r), nil
 				}
 				ip := fakePool.Lookup(host)
@@ -238,7 +278,7 @@ func newHandler(resolver resolver.Resolver, mapper *ResolverEnhancer) handler {
 	}
 
 	if mapper.mode == C.DNSFakeIP {
-		middlewares = append(middlewares, withFakeIP(mapper.fakeIPSkipper, mapper.fakeIPPool, mapper.fakeIPPool6, mapper.fakeIPTTL))
+		middlewares = append(middlewares, withFakeIP(mapper.fakeIPSkipper, mapper.fakeIPPool, mapper.fakeIPPool6, mapper.fakeIPTTL, mapper.strictV4, resolver))
 	}
 
 	if mapper.mode != C.DNSNormal {

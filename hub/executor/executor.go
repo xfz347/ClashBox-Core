@@ -17,6 +17,7 @@ import (
 	"github.com/metacubex/mihomo/adapter"
 	"github.com/metacubex/mihomo/adapter/inbound"
 	"github.com/metacubex/mihomo/adapter/outboundgroup"
+	"github.com/metacubex/mihomo/common/utils"
 	"github.com/metacubex/mihomo/component/auth"
 	"github.com/metacubex/mihomo/component/ca"
 	"github.com/metacubex/mihomo/component/dialer"
@@ -36,6 +37,7 @@ import (
 	"github.com/metacubex/mihomo/config"
 	C "github.com/metacubex/mihomo/constant"
 	P "github.com/metacubex/mihomo/constant/provider"
+	snifferTypes "github.com/metacubex/mihomo/constant/sniffer"
 	"github.com/metacubex/mihomo/dns"
 	"github.com/metacubex/mihomo/listener"
 	authStore "github.com/metacubex/mihomo/listener/auth"
@@ -285,6 +287,7 @@ func updateDNS(c *config.DNS, generalIPv6 bool) {
 		FakeIPPool6:   c.FakeIPPool6,
 		FakeIPSkipper: c.FakeIPSkipper,
 		FakeIPTTL:     c.FakeIPTTL,
+		StrictV4:      c.StrictV4,
 		UseHosts:      c.UseHosts,
 	})
 
@@ -432,7 +435,14 @@ func updateMITM(cfg *mitm.Config) {
 		}
 	}
 	if !tunnel.IsSniffing() {
-		log.Warnln("MITM requires the sniffer to be enabled; intercepted domains will not be detected")
+		// MITM 域名判定依赖嗅探出的 SNI/Host; 订阅关闭 sniffer 时运行时自动启用
+		// 默认嗅探(纯 dispatcher 注入, 不改写任何配置文件); MITM 关闭时不回关
+		if dispatcher, derr := newMITMSnifferDispatcher(); derr == nil {
+			tunnel.UpdateSniffer(dispatcher)
+			log.Warnln("[MITM] sniffer auto-enabled at runtime for domain detection")
+		} else {
+			log.Warnln("[MITM] auto-enable sniffer failed: %v; intercepted domains will not be detected", derr)
+		}
 	}
 	dir := filepath.Join(C.Path.HomeDir(), "mitm")
 	ca, err := mitm.LoadOrCreateCA(dir)
@@ -450,6 +460,29 @@ func updateMITM(cfg *mitm.Config) {
 
 func updateCron() {
 	mitm.UpdateCronScripts(loadCronScriptsFile())
+}
+
+// newMITMSnifferDispatcher 构造 MITM 自动嗅探所需的最小 sniffer dispatcher:
+// 仅嗅探域名(TLS SNI/HTTP Host/QUIC SNI), 不改写目标(OverrideDest=false), 纯运行时注入
+func newMITMSnifferDispatcher() (*sniffer.Dispatcher, error) {
+	httpPorts, err := utils.NewUnsignedRangesFromList[uint16]([]string{"80", "8080-8880"})
+	if err != nil {
+		return nil, err
+	}
+	tlsPorts, err := utils.NewUnsignedRangesFromList[uint16]([]string{"443", "8443"})
+	if err != nil {
+		return nil, err
+	}
+	return sniffer.NewDispatcher(&sniffer.Config{
+		Enable:          true,
+		ForceDnsMapping: true,
+		ParsePureIp:     true,
+		Sniffers: map[snifferTypes.Type]sniffer.SnifferConfig{
+			snifferTypes.HTTP: {Ports: httpPorts},
+			snifferTypes.TLS:  {Ports: tlsPorts},
+			snifferTypes.QUIC: {Ports: tlsPorts},
+		},
+	})
 }
 
 func loadCronScriptsFile() []mitm.CronScript {
