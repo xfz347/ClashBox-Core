@@ -17,8 +17,8 @@ import (
 	N "github.com/metacubex/mihomo/common/net"
 	"github.com/metacubex/mihomo/common/utils"
 	"github.com/metacubex/mihomo/component/loopback"
-	"github.com/metacubex/mihomo/component/nat"
 	"github.com/metacubex/mihomo/component/mitm"
+	"github.com/metacubex/mihomo/component/nat"
 	"github.com/metacubex/mihomo/component/process"
 	"github.com/metacubex/mihomo/component/proxydialer"
 	"github.com/metacubex/mihomo/component/resolver"
@@ -255,9 +255,32 @@ func RuleProviders() map[string]P.RuleProvider {
 // UpdateProxies handle update proxies
 func UpdateProxies(newProxies map[string]C.Proxy, newProviders map[string]P.ProxyProvider) {
 	configMux.Lock()
+	oldProviders := providers
 	proxies = newProxies
 	providers = newProviders
 	configMux.Unlock()
+	// ★ 全量重载时关闭旧 provider(取消其健康检查 ticker/连接句柄):
+	//   原实现只替换 map 不 Close, 上一个配置的健康检查定时器会永久存活并持续拨旧节点,
+	//   与新配置测速抢连接/触发运营商限速, 表现为"切换配置后新配置测速也大量超时";
+	//   多次切换还会累积泄漏。新配置的 provider 已生效, 旧对象可安全关闭。
+	if oldProviders != nil {
+		go func() {
+			for name, p := range oldProviders {
+				if newProviders != nil {
+					if np, ok := newProviders[name]; ok && np == p {
+						continue
+					}
+				}
+				// Provider 接口未声明 Close, 但具体实现(*proxySetProvider/*ProxySetProvider 等)都有;
+				// 用局部接口断言关闭, 避免污染公共接口。
+				if closer, ok := p.(interface{ Close() error }); ok {
+					if err := closer.Close(); err != nil {
+						log.Debugln("[UpdateProxies] close old provider %s: %v", name, err)
+					}
+				}
+			}
+		}()
+	}
 }
 
 func UpdateListeners(newListeners map[string]C.InboundListener) {
@@ -788,7 +811,7 @@ func match(metadata *C.Metadata, helper C.RuleMatchHelper) (C.Proxy, C.Rule, err
 					}
 				}
 
-				if ! smart {
+				if !smart {
 					metadata.SmartTarget = ""
 				} else {
 					metadata.SmartBlock = "normal"

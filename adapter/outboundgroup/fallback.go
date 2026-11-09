@@ -104,19 +104,19 @@ func (f *Fallback) Unwrap(metadata *C.Metadata, touch bool) C.Proxy {
 
 func (f *Fallback) findAliveProxy(touch bool) C.Proxy {
 	proxies := f.GetProxies(touch)
-	for _, proxy := range proxies {
-		if len(f.selected) == 0 {
-			if proxy.AliveForTestUrl(f.testUrl) {
+	// ★ 手动临时指定(代理页双击)优先且不受健康门控: 用户选中的节点即使没有近期
+	//   测速结果也必须生效, 且不得被自动清除(原实现 not alive 时清空 selected,
+	//   表现为双击后立刻回跳到自动选择)。
+	if f.selected != "" {
+		for _, proxy := range proxies {
+			if proxy.Name() == f.selected {
 				return proxy
 			}
-		} else {
-			if proxy.Name() == f.selected {
-				if proxy.AliveForTestUrl(f.testUrl) {
-					return proxy
-				} else {
-					f.selected = ""
-				}
-			}
+		}
+	}
+	for _, proxy := range proxies {
+		if proxy.AliveForTestUrl(f.testUrl) {
+			return proxy
 		}
 	}
 
@@ -140,7 +140,8 @@ func (f *Fallback) Set(name string) error {
 	if !p.AliveForTestUrl(f.testUrl) {
 		// ★ 无健康缓存时后台补测, 不阻塞切换 RPC:
 		// 原同步 URLTest 最长 5s, 冷启动/测速过期后切换 fallback 节点必然卡 5s(UI 转圈)。
-		// selected 已设置, findAliveProxy 会校验健康性, 后台测速完成前按原语义回退自动选择。
+		// selected 已设置, findAliveProxy 无条件优先返回选中节点(手动指定优先);
+		// 后台补测仅用于刷新健康数据, 不再影响手动选择的生效。
 		go func() {
 			ctx, cancel := context.WithTimeout(context.Background(), time.Millisecond*time.Duration(5000))
 			defer cancel()

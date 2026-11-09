@@ -111,10 +111,10 @@ func (u *URLTest) fast(touch bool) C.Proxy {
 	elm, _, shared := u.fastSingle.Do(func() (C.Proxy, error) {
 		proxies := u.GetProxies(touch)
 		if u.selected != "" {
+			// ★ 手动临时指定(代理页双击)优先且不受健康门控: 用户选中的节点即使没有
+			//   近期测速结果(AliveForTestUrl=false)也必须生效, 否则会被自动选择覆盖,
+			//   表现为双击后回跳到内核自动选择的节点。
 			for _, proxy := range proxies {
-				if !proxy.AliveForTestUrl(u.testUrl) {
-					continue
-				}
 				if proxy.Name() == u.selected {
 					u.fastNode = proxy
 					return proxy, nil

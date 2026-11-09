@@ -189,6 +189,11 @@ func (p *Proxy) URLTest(ctx context.Context, url string, expectedStatus utils.In
 			UrlTestHook(url, p.Name(), t)
 		}
 
+		// 诊断: 测速/健康检查失败时输出具体错误, 便于定位节点不可用原因
+		if err != nil {
+			log.Debugln("URLTest failed, proxy: %s, url: %s, err: %v", p.Name(), url, err)
+		}
+
 		alive := err == nil
 		record := C.DelayHistory{Time: time.Now()}
 		if alive {
