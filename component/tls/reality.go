@@ -60,6 +60,9 @@ func GetRealityConn(ctx context.Context, conn net.Conn, fingerprint UClientHello
 			if err != nil {
 				return nil, err
 			}
+			log.Warnln("REALITY: removed X25519MLKEM768 from handshake")
+		} else {
+			log.Warnln("REALITY: keeping X25519MLKEM768 in handshake")
 		}
 
 		hello := uConn.HandshakeState.Hello
@@ -88,6 +91,7 @@ func GetRealityConn(ctx context.Context, conn net.Conn, fingerprint UClientHello
 		ecdheKey := keyShareKeys.Ecdhe
 		if ecdheKey == nil {
 			ecdheKey = keyShareKeys.MlkemEcdhe
+			log.Warnln("REALITY: ecdheKey nil, using MlkemEcdhe=%v", ecdheKey != nil)
 		}
 		if ecdheKey == nil {
 			// WTF???
@@ -98,6 +102,7 @@ func GetRealityConn(ctx context.Context, conn net.Conn, fingerprint UClientHello
 		}
 		authKey, err := ecdheKey.ECDH(realityConfig.PublicKey)
 		if err != nil {
+			log.Warnln("REALITY: ECDH failed: %v", err)
 			return nil, err
 		}
 		if authKey == nil {
@@ -115,12 +120,14 @@ func GetRealityConn(ctx context.Context, conn net.Conn, fingerprint UClientHello
 		//log.Debugln("REALITY hello.sessionId: %v", hello.SessionId)
 		//log.Debugln("REALITY uConn.AuthKey: %v", authKey)
 
+		log.Warnln("REALITY dial: serverName=%s shortId=%x publicKey=%x supportMLKEM=%v", serverName, realityConfig.ShortID, realityConfig.PublicKey, realityConfig.SupportX25519MLKEM768)
+
 		err = uConn.HandshakeContext(ctx)
 		if err != nil {
 			return nil, err
 		}
 
-		log.Debugln("REALITY Authentication: %v, AEAD: %T", verifier.verified, aeadCipher)
+		log.Warnln("REALITY Authentication: verified=%v, AEAD: %T, serverName=%s", verifier.verified, aeadCipher, serverName)
 
 		if !verifier.verified {
 			go realityClientFallback(uConn, uConfig.ServerName, fingerprint)

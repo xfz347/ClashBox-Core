@@ -25,6 +25,7 @@ type Script struct {
 	Content  string `json:"content"`
 	Argument string `json:"argument"`
 	Engine   string `json:"engine"`
+	NodeAddress string `json:"nodeAddress"`
 }
 
 // CronScript is a scheduled (cron) script executed by the in-process scheduler.
@@ -34,6 +35,7 @@ type CronScript struct {
 	Content  string `json:"content"`
 	Argument string `json:"argument"`
 	Enabled  bool   `json:"enabled"`
+	NodeAddress string `json:"nodeAddress"`
 }
 
 // JqRule is a Surge [Body Rewrite] jq expression.

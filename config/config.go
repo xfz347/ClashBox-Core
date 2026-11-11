@@ -384,6 +384,8 @@ type RawModuleProvider struct {
 	Path     string `yaml:"path" json:"path"`
 	Target   string `yaml:"target" json:"target"`
 	Behavior string `yaml:"behavior" json:"behavior"`
+	URL      string `yaml:"url,omitempty" json:"url,omitempty"`
+	Format   string `yaml:"format,omitempty" json:"format,omitempty"`
 }
 
 type RawMITMJq struct {

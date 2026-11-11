@@ -6,8 +6,8 @@ import "sync/atomic"
 
 // 标准模式与低内存模式的缓冲区大小(运行时切换)
 const (
-	relaySizeStandard  = 32 * 1024
-	udpSizeStandard    = 16 * 1024
+	relaySizeStandard  = 256 * 1024
+	udpSizeStandard    = 64 * 1024
 	relaySizeLowMemory = 16 * 1024
 	udpSizeLowMemory   = 8 * 1024
 )

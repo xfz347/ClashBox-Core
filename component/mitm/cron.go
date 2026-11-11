@@ -2,6 +2,7 @@ package mitm
 
 import (
 	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -40,7 +41,7 @@ func UpdateCronScripts(scripts []CronScript) {
 
 	cronEntries = cronEntries[:0]
 	for _, s := range scripts {
-		if s.Enabled && strings.TrimSpace(s.Content) != "" && cronScheduleValid(s.Schedule) {
+		if s.Enabled && strings.TrimSpace(s.Content) != "" && (cronScheduleValid(s.Schedule) || strings.TrimSpace(s.Schedule) == "") {
 			cronEntries = append(cronEntries, cronEntry{script: s})
 			log.Warnln("[cron] entry accepted: name=%q schedule=%q len(content)=%d", s.Name, s.Schedule, len(s.Content))
 		} else {
@@ -146,11 +147,40 @@ func FireCronScript(name string) string {
 	return `{"ok":true}`
 }
 
+func FireGenericScript(payload string) string {
+	var req struct {
+		Name        string `json:"name"`
+		Argument    string `json:"argument"`
+		NodeAddress string `json:"nodeAddress"`
+	}
+	if err := json.Unmarshal([]byte(payload), &req); err != nil {
+		return `{"ok":false,"error":"invalid json"}`
+	}
+	cronMu.Lock()
+	var found *CronScript
+	for i := range cronEntries {
+		if cronEntries[i].script.Name == req.Name {
+			found = &cronEntries[i].script
+			break
+		}
+	}
+	cronMu.Unlock()
+	if found == nil {
+		return `{"ok":false,"error":"not found"}`
+	}
+	script := *found
+	script.Argument = req.Argument
+	script.NodeAddress = req.NodeAddress
+	go runCronScript(script)
+	log.Warnln("[generic] manual fire: name=%q argument=%q", req.Name, req.Argument)
+	return `{"ok":true}`
+}
+
 func runCronScript(script CronScript) {
 	defer func() {
 		if r := recover(); r != nil {
 			log.Warnln("[cron] script %q panic: %v", script.Name, r)
-			writeCronNotify(script.Name, false)
+			writeCronNotify(script.Name, false, fmt.Sprintf("panic: %v", r))
 		}
 	}()
 	if ExternalScriptExecutor == nil {
@@ -164,10 +194,14 @@ func runCronScript(script CronScript) {
 		Content:  script.Content,
 		Argument: script.Argument,
 		Engine:   "quickjs",
+		NodeAddress: script.NodeAddress,
 	}, nil, nil, nil)
 	if err != nil {
 		log.Warnln("[cron] script %q failed: %v", script.Name, err)
-		writeCronNotify(script.Name, false)
+		snippet := script.Content
+		if len(snippet) > 300 { snippet = snippet[:300] }
+		_ = os.WriteFile(filepath.Join(constant.Path.HomeDir(), "cron-error-detail.txt"), []byte(fmt.Sprintf("script: %s\nerror: %v\ncontent:\n%s", script.Name, err, script.Content)), 0600)
+		writeCronNotify(script.Name, false, fmt.Sprintf("%v | %s", err, snippet))
 		return
 	}
 	writeCronNotify(script.Name, true)
@@ -179,16 +213,20 @@ func runCronScript(script CronScript) {
 }
 
 // writeCronNotify 记录最近一次 cron 运行结果，供 VPN 进程读取后发通知。
-func writeCronNotify(name string, success bool) {
+func writeCronNotify(name string, success bool, errMsg ...string) {
 	dir := constant.Path.HomeDir()
 	if dir == "" {
 		return
 	}
-	payload, _ := json.Marshal(map[string]interface{}{
+	notify := map[string]interface{}{
 		"name":      name,
 		"timestamp": time.Now().UnixMilli(),
 		"success":   success,
-	})
+	}
+	if len(errMsg) > 0 && errMsg[0] != "" {
+		notify["error"] = errMsg[0]
+	}
+	payload, _ := json.Marshal(notify)
 	_ = os.WriteFile(filepath.Join(dir, "cron-notify.json"), payload, 0600)
 }
 

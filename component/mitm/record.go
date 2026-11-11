@@ -2,6 +2,7 @@ package mitm
 
 import (
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -115,4 +116,17 @@ func ClearRecords() {
 	recordStore.items = make([]Record, recordLimit)
 	recordStore.start = 0
 	recordStore.count = 0
+}
+
+// 记录详情采集窗口: 默认不采集 header/body(省电), 拦截记录页/AdProbe 访问时开启一段窗口。
+var recordDetailUntil atomic.Int64
+
+// TouchRecordCapture 开启/续期记录详情采集(默认 5 分钟)。
+func TouchRecordCapture() {
+	recordDetailUntil.Store(time.Now().Add(5 * time.Minute).UnixMilli())
+}
+
+func recordCaptureActive() bool {
+	until := recordDetailUntil.Load()
+	return until > 0 && time.Now().UnixMilli() < until
 }

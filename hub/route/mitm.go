@@ -33,6 +33,7 @@ func mitmRouter() http.Handler {
 // getMitmRequests 默认返回轻量摘要(最近 N 条, 不含 body/headers), 避免大记录集卡顿。
 // query: limit=条数(默认 200, 上限 1000); full=1 返回完整记录(广告抓取分析用)。
 func getMitmRequests(w http.ResponseWriter, r *http.Request) {
+	mitm.TouchRecordCapture()
 	query := r.URL.Query()
 	if query.Get("full") == "1" {
 		render.JSON(w, r, mitm.Records())
@@ -52,6 +53,7 @@ func getMitmRequests(w http.ResponseWriter, r *http.Request) {
 
 // getMitmRequestDetail 按 (time,host,path) 返回单条完整记录(点击详情时按需拉取)。
 func getMitmRequestDetail(w http.ResponseWriter, r *http.Request) {
+	mitm.TouchRecordCapture()
 	query := r.URL.Query()
 	ts, _ := strconv.ParseInt(query.Get("time"), 10, 64)
 	record, ok := mitm.RecordDetail(ts, query.Get("host"), query.Get("path"))

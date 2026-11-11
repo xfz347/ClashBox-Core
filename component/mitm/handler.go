@@ -119,6 +119,7 @@ type compiledHTTPRule struct {
 }
 
 type enginePolicyKey struct{}
+type baseMetaKey struct{}
 
 func userAgentPattern(pattern string) string {
 	quoted := regexp.QuoteMeta(pattern)
@@ -140,6 +141,8 @@ type Handler struct {
 	locals    []compiledLocalResponse
 	jqRules   []compiledJq
 	httpRules []compiledHTTPRule
+	// 上游传输池(按请求 policy 分组), 跨连接复用以减少重复 TLS 握手(CPU/发热)
+	transports sync.Map
 }
 
 // New creates a MITM handler. dial must not route the connection back into
@@ -271,11 +274,8 @@ func (h *Handler) Handle(conn net.Conn, metadata *C.Metadata) {
 	}
 	defer httpConn.Close()
 
-	transport := h.newTransport(metadata)
-	defer transport.CloseIdleConnections()
-
 	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		h.serveHTTP(w, r, metadata, transport, tlsConn)
+		h.serveHTTP(w, r, metadata, tlsConn)
 	})
 
 	if tlsConn != nil && tlsConn.ConnectionState().NegotiatedProtocol == "h2" {
@@ -292,7 +292,16 @@ func (h *Handler) Handle(conn net.Conn, metadata *C.Metadata) {
 	_ = server.Serve(&singleConnListener{conn: httpConn})
 }
 
-func (h *Handler) newTransport(base *C.Metadata) *http.Transport {
+func (h *Handler) transportFor(policy string) *http.Transport {
+	if v, ok := h.transports.Load(policy); ok {
+		return v.(*http.Transport)
+	}
+	tr := h.buildTransport()
+	actual, _ := h.transports.LoadOrStore(policy, tr)
+	return actual.(*http.Transport)
+}
+
+func (h *Handler) buildTransport() *http.Transport {
 	return &http.Transport{
 		Proxy: nil,
 		DialContext: func(ctx context.Context, network, address string) (net.Conn, error) {
@@ -305,7 +314,18 @@ func (h *Handler) newTransport(base *C.Metadata) *http.Transport {
 			if err != nil {
 				return nil, err
 			}
-			meta := base.Clone()
+			var base *C.Metadata
+			if v := ctx.Value(baseMetaKey{}); v != nil {
+				if m, ok := v.(*C.Metadata); ok {
+					base = m
+				}
+			}
+			var meta *C.Metadata
+			if base != nil {
+				meta = base.Clone()
+			} else {
+				meta = &C.Metadata{}
+			}
 			meta.Host = normalizeDomain(host)
 			meta.DstIP = netip.Addr{}
 			meta.DstPort = uint16(port)
@@ -324,7 +344,8 @@ func (h *Handler) newTransport(base *C.Metadata) *http.Transport {
 		DisableCompression:    true,
 		ResponseHeaderTimeout: 30 * time.Second,
 		IdleConnTimeout:       90 * time.Second,
-		MaxIdleConnsPerHost:   4,
+		MaxIdleConns:          64,
+		MaxIdleConnsPerHost:   8,
 	}
 }
 
@@ -350,7 +371,7 @@ func (h *Handler) matchHTTPRule(req *http.Request) *compiledHTTPRule {
 	return nil
 }
 
-func (h *Handler) serveHTTP(w http.ResponseWriter, r *http.Request, base *C.Metadata, transport *http.Transport, tlsConn *tls.Conn) {
+func (h *Handler) serveHTTP(w http.ResponseWriter, r *http.Request, base *C.Metadata, tlsConn *tls.Conn) {
 	start := time.Now()
 	host := requestHost(r.Host)
 	if host == "" && tlsConn != nil {
@@ -367,8 +388,12 @@ func (h *Handler) serveHTTP(w http.ResponseWriter, r *http.Request, base *C.Meta
 		record.Path = r.URL.Path
 	}
 	// 请求头 + 请求体预览（截断，便于拦截记录查看完整信息）
-	record.ReqHeaders = headerToMap(r.Header)
-	if r.Body != nil && r.Method != http.MethodGet && r.Method != http.MethodHead {
+	// 请求头 + 请求体预览(仅在记录采集窗口内, 降低常态开销)
+	captureDetail := recordCaptureActive()
+	if captureDetail {
+		record.ReqHeaders = headerToMap(r.Header)
+	}
+	if captureDetail && r.Body != nil && r.Method != http.MethodGet && r.Method != http.MethodHead {
 		if preview, err := io.ReadAll(io.LimitReader(r.Body, recordBodyPreviewLimit)); err == nil && len(preview) > 0 {
 			// ★ 必须用 MultiReader 把已读部分拼回原始 body 再转发:
 			//   之前直接 r.Body = bytes.NewReader(preview) 会把 >8KB 的请求体截断,
@@ -401,6 +426,11 @@ func (h *Handler) serveHTTP(w http.ResponseWriter, r *http.Request, base *C.Meta
 
 	outReq := r.Clone(r.Context())
 	outReq.RequestURI = ""
+	// 把连接级 metadata 放进请求 context, 供上游 Transport 的 DialContext 复用(按请求取值)
+	if base != nil {
+		outReq = outReq.WithContext(context.WithValue(outReq.Context(), baseMetaKey{}, base))
+	}
+	reqPolicy := ""
 	scheme := "https"
 	if base != nil && base.DstPort == 80 {
 		scheme = "http"
@@ -424,8 +454,8 @@ func (h *Handler) serveHTTP(w http.ResponseWriter, r *http.Request, base *C.Meta
 			return
 		}
 		if policy != "" {
+			reqPolicy = policy
 			outReq = outReq.WithContext(context.WithValue(outReq.Context(), enginePolicyKey{}, policy))
-			outReq.Close = true
 		}
 	}
 	removeHopByHop(outReq.Header)
@@ -453,9 +483,11 @@ func (h *Handler) serveHTTP(w http.ResponseWriter, r *http.Request, base *C.Meta
 		}
 		record.Status = local.status
 		record.Location = local.location
-		record.RespHeaders = local.headers
-		if len(local.body) > 0 && len(local.body) <= 16384 {
-			record.RespPreview = string(local.body)
+		if captureDetail {
+			record.RespHeaders = local.headers
+			if len(local.body) > 0 && len(local.body) <= 16384 {
+				record.RespPreview = string(local.body)
+			}
 		}
 		if record.Location == "" {
 			record.Location = local.headers["Location"]
@@ -480,7 +512,7 @@ func (h *Handler) serveHTTP(w http.ResponseWriter, r *http.Request, base *C.Meta
 			outReq.URL.Host = r.Host
 		}
 	}
-	resp, err := transport.RoundTrip(outReq)
+	resp, err := h.transportFor(reqPolicy).RoundTrip(outReq)
 	if err == nil && resp != nil {
 		if host == "sub.store" && resp.Header.Get("Location") == "https://sub-store.vercel.app/" {
 			resp.Header.Set("Location", "https://sub-store.vercel.app/?api=https://sub.store")
@@ -499,10 +531,36 @@ func (h *Handler) serveHTTP(w http.ResponseWriter, r *http.Request, base *C.Meta
 	h.applyResponseScripts(resp)
 	h.applyResponseRewrites(resp)
 	removeHopByHop(resp.Header)
-	// 响应头 + 响应体预览（截断），用 MultiReader 恢复以便 io.Copy 读完整内容
-	record.RespHeaders = headerToMap(resp.Header)
-	if resp.Body != nil {
-		if preview, err := io.ReadAll(io.LimitReader(resp.Body, recordBodyPreviewLimit)); err == nil && len(preview) > 0 {
+	// 响应头 + 响应体预览(仅采集窗口内), 用 MultiReader 恢复以便 io.Copy 读完整内容
+	if captureDetail {
+		record.RespHeaders = headerToMap(resp.Header)
+	}
+	if captureDetail && resp.Body != nil {
+		enc := strings.TrimSpace(resp.Header.Get("Content-Encoding"))
+		maxBody := int64(h.cfg.MaxBodySize)
+		if maxBody <= 0 {
+			maxBody = 1 << 20
+		}
+		if enc != "" && (resp.ContentLength < 0 || resp.ContentLength <= maxBody) {
+			// 采集窗口内: 缓冲完整压缩体, 解压后存明文预览(排查 gzip 接口), 再把原始压缩体放回继续转发
+			raw, rerr := io.ReadAll(io.LimitReader(resp.Body, maxBody+1))
+			if rerr == nil && int64(len(raw)) <= maxBody {
+				plain := decompressBody(raw, enc)
+				preview := plain
+				if len(preview) > recordBodyPreviewLimit {
+					preview = preview[:recordBodyPreviewLimit]
+				}
+				if len(preview) > 0 {
+					record.RespPreview = string(preview)
+				}
+				resp.Body = io.NopCloser(bytes.NewReader(raw))
+			} else {
+				resp.Body = struct {
+					io.Reader
+					io.Closer
+				}{Reader: io.MultiReader(bytes.NewReader(raw), resp.Body), Closer: resp.Body}
+			}
+		} else if preview, err := io.ReadAll(io.LimitReader(resp.Body, recordBodyPreviewLimit)); err == nil && len(preview) > 0 {
 			record.RespPreview = string(preview)
 			resp.Body = struct {
 				io.Reader
@@ -710,16 +768,41 @@ func (h *Handler) applyRequestRewrites(req *http.Request) *localResponse {
 				if status >= 300 {
 					body = []byte("Blocked by module")
 				}
+				// Loon reject_dict(N): 返回 JSON 空对象 {} 并带 application/json, 小程序按 JSON 解析才不报错
+				if strings.Contains(strings.ToLower(rewrite.flag), "dict") {
+					return &localResponse{status: status, body: []byte("{}"), headers: map[string]string{"Content-Type": "application/json; charset=utf-8"}}
+				}
 				return &localResponse{status: status, body: body}
 			}
 		case "redirect":
 			re := cachedRegex(rewrite.pattern)
-			if re != nil && re.MatchString(req.URL.String()) {
+			full := req.URL.String()
+			// 鸿蒙等客户端会把 pfurl/url 等参数百分号编码, 直连匹配失败时用解码后的 URL 再试一次
+			matchStr := full
+			if re != nil && !re.MatchString(matchStr) {
+				if dec, derr := url.PathUnescape(matchStr); derr == nil && dec != matchStr && re.MatchString(dec) {
+					matchStr = dec
+				}
+			}
+			if re != nil && re.MatchString(matchStr) {
 				status := http.StatusFound
 				if rewrite.flag == "307" {
 					status = http.StatusTemporaryRedirect
 				}
-				return &localResponse{status: status, location: rewrite.target}
+				location := rewrite.target
+				if strings.Contains(location, "$") {
+					if idx := re.FindStringSubmatchIndex(matchStr); idx != nil {
+						location = string(re.ExpandString(nil, location, matchStr, idx))
+					}
+				}
+				// 捕获到整个 URL 被百分号编码的情况(如 pfurl=https%3A%2F%2F...), 解码后再跳转, 否则 WebView 当相对路径
+				lowLoc := strings.ToLower(location)
+				if strings.HasPrefix(lowLoc, "http%3a") || strings.HasPrefix(lowLoc, "https%3a") {
+					if decLoc, decErr := url.PathUnescape(location); decErr == nil {
+						location = decLoc
+					}
+				}
+				return &localResponse{status: status, location: location}
 			}
 		}
 	}
