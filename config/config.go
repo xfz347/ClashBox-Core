@@ -1105,7 +1105,8 @@ func parseProxies(cfg *RawConfig) (proxies map[string]C.Proxy, providersMap map[
 	if !hasGlobal {
 		global, err := outboundgroup.NewSelector(
 			outboundgroup.GroupCommonOption{
-				Name: "GLOBAL",
+				Name:   "GLOBAL",
+				Hidden: true,
 			},
 			outboundgroup.SelectorOption{},
 			proxies["COMPATIBLE"],
@@ -1122,6 +1123,7 @@ func parseProxies(cfg *RawConfig) (proxies map[string]C.Proxy, providersMap map[
 		return nil, nil, err
 	}
 
+	SetProxyNameList(proxyList)
 	return proxies, providersMap, nil
 }
 
