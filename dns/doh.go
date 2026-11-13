@@ -225,6 +225,7 @@ func (doh *dnsOverHTTPS) exchangeHTTPS(ctx context.Context, client *http.Client,
 	httpReq.Header.Set("User-Agent", "")
 	httpResp, err := client.Do(httpReq)
 	if err != nil {
+		log.Warnln("[DoH] exchangeHTTPS request failed: url=%s err=%v", doh.url.String(), err)
 		return nil, fmt.Errorf("requesting %s: %w", doh.url, err)
 	}
 	defer httpResp.Body.Close()
@@ -235,6 +236,7 @@ func (doh *dnsOverHTTPS) exchangeHTTPS(ctx context.Context, client *http.Client,
 	}
 
 	if httpResp.StatusCode != http.StatusOK {
+		log.Warnln("[DoH] exchangeHTTPS non-200: url=%s status=%d bodySize=%d", doh.url.String(), httpResp.StatusCode, len(body))
 		return nil,
 			fmt.Errorf(
 				"expected status %d, got %d from %s",
@@ -247,6 +249,7 @@ func (doh *dnsOverHTTPS) exchangeHTTPS(ctx context.Context, client *http.Client,
 	resp = &D.Msg{}
 	err = resp.Unpack(body)
 	if err != nil {
+		log.Warnln("[DoH] exchangeHTTPS unpack failed: url=%s bodyLen=%d err=%v", doh.url.String(), len(body), err)
 		return nil, fmt.Errorf(
 			"unpacking response from %s: body is %s: %w",
 			doh.url,
@@ -254,6 +257,7 @@ func (doh *dnsOverHTTPS) exchangeHTTPS(ctx context.Context, client *http.Client,
 			err,
 		)
 	}
+	log.Warnln("[DoH] exchangeHTTPS ok: url=%s rcode=%d answers=%d", doh.url.String(), resp.Rcode, len(resp.Answer))
 
 	if resp.Id != req.Id {
 		err = D.ErrId
@@ -362,8 +366,10 @@ func (doh *dnsOverHTTPS) getClient(ctx context.Context) (c *http.Client, isCache
 func (doh *dnsOverHTTPS) createClient(ctx context.Context) (*http.Client, error) {
 	transport, err := doh.createTransport(ctx)
 	if err != nil {
+		log.Warnln("[DoH] createTransport failed: url=%s err=%v", doh.url.String(), err)
 		return nil, fmt.Errorf("[%s] initializing http transport: %w", doh.url.String(), err)
 	}
+	log.Warnln("[DoH] createTransport ok: url=%s type=%T", doh.url.String(), transport)
 
 	client := &http.Client{
 		Transport: transport,

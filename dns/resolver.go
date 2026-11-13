@@ -298,7 +298,19 @@ func (r *Resolver) shouldOnlyQueryFallback(m *D.Msg) bool {
 
 func (r *Resolver) ipExchange(ctx context.Context, m *D.Msg) (msg *D.Msg, err error) {
 	if matched := r.matchPolicy(m); len(matched) != 0 {
+		domain := msgToDomain(m)
+		policyAddrs := make([]string, 0, len(matched))
+		for _, c := range matched {
+			policyAddrs = append(policyAddrs, c.Address())
+		}
+		log.Warnln("[DNS] ipExchange matchPolicy: domain=%s policy=%v", domain, policyAddrs)
 		res := <-r.asyncExchange(ctx, matched, m)
+		if res.Error != nil {
+			log.Warnln("[DNS] ipExchange policy failed: domain=%s err=%v", domain, res.Error)
+		} else {
+			ips := msgToIP(res.Msg)
+			log.Warnln("[DNS] ipExchange policy ok: domain=%s ips=%v", domain, ips)
+		}
 		return res.Msg, res.Error
 	}
 
@@ -608,12 +620,17 @@ func NewResolver(config Config) (rs Resolvers) {
 	rs.Resolver = r
 
 	if len(config.ProxyServer) != 0 {
+		proxyPolicy := makePolicy(config.ProxyServerPolicy)
+		if len(config.Policy) > 0 {
+			proxyPolicy = append(proxyPolicy, makePolicy(config.Policy)...)
+		}
+		log.Warnln("[DNS] ProxyResolver policy count: own=%d + main=%d = %d", len(makePolicy(config.ProxyServerPolicy)), len(makePolicy(config.Policy)), len(proxyPolicy))
 		rs.ProxyResolver = &Resolver{
 			ipv6:        config.IPv6,
 			main:        cacheTransform(config.ProxyServer),
 			cache:       config.newCache(),
 			ipv6Timeout: time.Duration(config.IPv6Timeout) * time.Millisecond,
-			policy:      makePolicy(config.ProxyServerPolicy),
+			policy:      proxyPolicy,
 		}
 	}
 

@@ -16,6 +16,7 @@ import (
 	"github.com/metacubex/mihomo/component/keepalive"
 	"github.com/metacubex/mihomo/component/mptcp"
 	"github.com/metacubex/mihomo/component/resolver"
+	"github.com/metacubex/mihomo/log"
 )
 
 const (
@@ -407,7 +408,11 @@ func parseAddr(ctx context.Context, network, address string, preferResolver reso
 		ips, err = resolver.LookupIPWithResolver(ctx, host, preferResolver)
 	}
 	if err != nil {
+		log.Warnln("[Dialer] parseAddr resolve failed: host=%s resolver=%T err=%v", host, preferResolver, err)
 		return nil, "-1", fmt.Errorf("dns resolve failed: %w", err)
+	}
+	if len(ips) > 0 {
+		log.Warnln("[Dialer] parseAddr resolved: host=%s → %s (resolver=%T)", host, ips[0], preferResolver)
 	}
 	for i, ip := range ips {
 		if ip.Is4In6() {
