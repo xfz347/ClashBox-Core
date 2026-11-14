@@ -644,7 +644,11 @@ func handleTCPConn(connCtx C.ConnContext) {
 	configMux.RLock()
 	interceptor := mitmHandler
 	configMux.RUnlock()
-	if interceptor != nil && interceptor.Enabled() && (metadata.DstPort == 443 || metadata.DstPort == 80) && interceptor.Match(metadata.Host) {
+	// ★ 支持任意端口的 HTTPS MITM(个税等政务 App 使用非标端口, 如 18443):
+	//   域名已由 interceptor.Match 过滤, 端口不再限制;
+	//   非 443 端口的 TLS 握手在 handler 内进行, 失败即关闭连接,
+	//   只影响用户显式配置进 MITM 列表的域名, 不影响普通流量
+	if interceptor != nil && interceptor.Enabled() && interceptor.Match(metadata.Host) {
 		interceptor.Handle(conn, metadata)
 		return
 	}

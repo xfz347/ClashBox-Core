@@ -252,7 +252,9 @@ func (h *Handler) Handle(conn net.Conn, metadata *C.Metadata) {
 	_ = conn.SetDeadline(time.Now().Add(15 * time.Second))
 	var tlsConn *tls.Conn
 	var httpConn net.Conn = conn
-	if metadata.DstPort == 443 {
+	// ★ 非 80 端口一律尝试 TLS 握手: 支持 18443 等非标 HTTPS 端口(个税等政务 App);
+	//   80 端口保持明文转发。握手失败会关闭连接(仅影响 MITM 列表内域名)
+	if metadata.DstPort != 80 {
 		tlsConn = tls.Server(conn, &tls.Config{
 			GetCertificate: h.ca.GetCertificate,
 			NextProtos:     []string{"h2", "http/1.1"},
